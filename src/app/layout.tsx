@@ -1,4 +1,6 @@
 import type { Metadata } from 'next';
+import { Analytics } from '@vercel/analytics/react';
+import { SpeedInsights } from '@vercel/speed-insights/next';
 import { Roboto_Mono } from 'next/font/google';
 import '../../assets/globals.css';
 import tw from 'tailwind-styled-components';
@@ -18,6 +20,8 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
+      <Analytics />
+      <SpeedInsights />
       <Body className={robotoMono.className}>{children}</Body>
     </html>
   );
