@@ -1,4 +1,4 @@
-import { Badge } from '../ui/Badge/Badge';
+import { Badge } from '../../ui/Badge/Badge';
 import Image from 'next/image';
 
 interface WorkExperienceProps {

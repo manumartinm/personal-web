@@ -6,7 +6,7 @@ import { Github } from '@styled-icons/boxicons-logos/Github';
 import { Instagram } from '@styled-icons/boxicons-logos/Instagram';
 import { CalendarDays } from '@styled-icons/fa-solid/CalendarDays';
 import { Location } from '@styled-icons/entypo/Location';
-import { Button } from '../ui/Button/Button';
+import { Button } from '../../ui/Button/Button';
 
 interface HeroProps {
   description: string;
