@@ -1,12 +1,21 @@
 'use client';
 
 import { Hero } from '@/components/Hero/Hero';
-import { WorkExperience } from '@/components/WorkExperience/WorkExperience';
+import {
+  WorkExperience,
+  WorkExperienceProps,
+} from '@/components/WorkExperience/WorkExperience';
+import { Collections } from '@/DTO/Collections';
+import useReadDatabase from '@/hooks/useReadDatabase';
 import { IconText } from '@/ui/IconText/IconText';
 import { InfoCard } from '@/ui/InfoCard/InfoCard';
 import { ReactLogo } from '@styled-icons/boxicons-logos/ReactLogo';
 
 const MainPage = () => {
+  const workExperienceData = useReadDatabase<WorkExperienceProps>(
+    Collections.work_experience,
+  );
+
   return (
     <main className="w-full flex flex-col space-y-24">
       <Hero
@@ -53,42 +62,9 @@ const MainPage = () => {
           </p>
         </div>
         <div className="relative pl-6 after:absolute after:inset-y-0 after:left-0 after:w-px after:bg-muted-foreground/20 grid gap-12">
-          <WorkExperience
-            company="Company A"
-            dateInfo={{
-              start: new Date(),
-              end: new Date(),
-            }}
-            description="Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
-            badges={[
-              {
-                name: 'React',
-                link: '#',
-              },
-              {
-                name: 'TypeScript',
-                link: '#',
-              },
-            ]}
-          />
-          <WorkExperience
-            company="Company A"
-            dateInfo={{
-              start: new Date(),
-              end: new Date(),
-            }}
-            description="Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
-            badges={[
-              {
-                name: 'React',
-                link: '#',
-              },
-              {
-                name: 'TypeScript',
-                link: '#',
-              },
-            ]}
-          />
+          {workExperienceData.map((workExperience, index) => (
+            <WorkExperience key={index} {...workExperience} />
+          ))}
         </div>
       </div>
       <div className="container grid gap-12 px-4 md:px-6">

@@ -1,13 +1,11 @@
 import { Badge } from '../../ui/Badge/Badge';
 import Image from 'next/image';
 
-interface WorkExperienceProps {
+export interface WorkExperienceProps {
   company: string;
   companyLogo?: string;
-  dateInfo: {
-    start: Date;
-    end: Date;
-  };
+  startDate: string;
+  endDate: string;
   description: string;
   badges?: {
     name: string;
@@ -18,7 +16,8 @@ interface WorkExperienceProps {
 export const WorkExperience: React.FC<WorkExperienceProps> = ({
   company,
   companyLogo,
-  dateInfo,
+  startDate,
+  endDate,
   description,
   badges,
 }) => {
@@ -39,7 +38,7 @@ export const WorkExperience: React.FC<WorkExperienceProps> = ({
             <h3 className="text-lg font-semibold">Front-end Developer</h3>
             <p className="text-sm text-muted-foreground">
               {company} <span className="text-muted-foreground">•</span>{' '}
-              {`${new Date(dateInfo.start).toLocaleDateString()} - ${new Date(dateInfo.end).toLocaleDateString()}`}
+              {`${new Date(startDate).toLocaleDateString()} - ${new Date(endDate).toLocaleDateString()}`}
             </p>
           </div>
         </div>
