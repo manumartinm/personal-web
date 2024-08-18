@@ -4,8 +4,13 @@
 
 body {
   color: rgb(var(--foreground-rgb));
-  background: white;
+  background-image: 
+    linear-gradient(#f7f7f7 0.5px, transparent 0.5px, transparent calc(100% - 0.5px), #f7f7f7 calc(100% - 0.5px)), 
+    linear-gradient(90deg, #f7f7f7 0.5px, transparent 0.5px, transparent calc(100% - 0.5px), #f7f7f7 calc(100% - 0.5px));
+  background-size: 100px 100px; /* Ajusta este valor para cambiar el tamaño de los cuadrados */
+  border: 0.5px solid #f7f7f7;
 }
+
 
 @layer utilities {
   .text-balance {

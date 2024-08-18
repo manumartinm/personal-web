@@ -1,5 +1,6 @@
 import { Badge } from '../../ui/Badge/Badge';
 import Image from 'next/image';
+import tw from 'tailwind-styled-components';
 
 export interface WorkExperienceProps {
   company: string;
@@ -12,6 +13,18 @@ export interface WorkExperienceProps {
     link: string;
   }[];
 }
+const WorkExperienceContainer = tw.div`grid gap-4 relative`;
+const TimelineDot = tw.div`aspect-square w-3 bg-primary rounded-full absolute left-0 translate-x-[-29.5px] z-10 top-1`;
+const ExperienceCard = tw.div`relative overflow-hidden rounded-lg bg-background shadow-lg transition-transform duration-300 ease-in-out hover:-translate-y-2 hover:shadow-xl`;
+const CardHeader = tw.div`flex items-center gap-4 border-b p-6`;
+const CompanyLogo = tw(Image)`rounded-md`;
+const HeaderContent = tw.div`flex-1`;
+const JobTitle = tw.h3`text-lg font-semibold`;
+const CompanyInfo = tw.p`text-sm text-muted-foreground`;
+const JobDescription = tw.div`flex items-center gap-4 p-6`;
+const DescriptionText = tw.p`text-sm text-muted-foreground`;
+const BadgesSection = tw.div`flex items-center gap-2 border-t p-6`;
+const BadgesWrapper = tw.div`flex flex-wrap gap-2`;
 
 export const WorkExperience: React.FC<WorkExperienceProps> = ({
   company,
@@ -22,39 +35,38 @@ export const WorkExperience: React.FC<WorkExperienceProps> = ({
   badges,
 }) => {
   return (
-    <div className="grid gap-4 relative">
-      <div className="aspect-square w-3 bg-primary rounded-full absolute left-0 translate-x-[-29.5px] z-10 top-1" />
-      <div className="relative overflow-hidden rounded-lg bg-background shadow-lg transition-transform duration-300 ease-in-out hover:-translate-y-2 hover:shadow-xl">
-        <div className="flex items-center gap-4 border-b p-6">
-          <Image
+    <WorkExperienceContainer>
+      <TimelineDot />
+      <ExperienceCard>
+        <CardHeader>
+          <CompanyLogo
             src={companyLogo ? `./${companyLogo}.png` : '/company.jpg'}
             width={48}
             height={48}
             alt={`${company} logo`}
-            className="rounded-md"
             style={{ aspectRatio: '48/48', objectFit: 'cover' }}
           />
-          <div className="flex-1">
-            <h3 className="text-lg font-semibold">Front-end Developer</h3>
-            <p className="text-sm text-muted-foreground">
-              {company} <span className="text-muted-foreground">•</span>{' '}
+          <HeaderContent>
+            <JobTitle>Front-end Developer</JobTitle>
+            <CompanyInfo>
+              {company} <span>•</span>{' '}
               {`${new Date(startDate).toLocaleDateString()} - ${new Date(endDate).toLocaleDateString()}`}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-4 p-6">
-          <p className="text-sm text-muted-foreground">{description}</p>
-        </div>
+            </CompanyInfo>
+          </HeaderContent>
+        </CardHeader>
+        <JobDescription>
+          <DescriptionText>{description}</DescriptionText>
+        </JobDescription>
         {badges?.length && (
-          <div className="flex items-center gap-2 border-t p-6">
-            <div className="flex flex-wrap gap-2">
+          <BadgesSection>
+            <BadgesWrapper>
               {badges.map(({ name, link }) => (
                 <Badge key={name} text={name} link={link} />
               ))}
-            </div>
-          </div>
+            </BadgesWrapper>
+          </BadgesSection>
         )}
-      </div>
-    </div>
+      </ExperienceCard>
+    </WorkExperienceContainer>
   );
 };

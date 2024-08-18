@@ -10,14 +10,15 @@ export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse,
 ) {
-  const jsonDirectory = path.join(process.cwd(), 'databse');
+  const jsonDirectory = path.join(process.cwd(), 'database');
 
-  const collection = req.query.collection;
+  const collection = req.query.collection as Collections;
+  const validCollections = collections.map((collection) => collection.value);
 
   if (
     typeof collection !== 'string' ||
     !collection ||
-    !Object.keys(collections).includes(collection)
+    !validCollections.includes(collection)
   )
     res.status(400).json({ message: 'Invalid collection' });
 
