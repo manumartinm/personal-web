@@ -1,31 +1,35 @@
 import path from 'path';
 import { promises as fs } from 'fs';
-import { NextApiRequest, NextApiResponse } from 'next';
 import { enumToOptions } from '@/utils/enum-to-object';
 import { Collections } from '@/DTO/Collections';
+import { NextResponse } from 'next/server';
 
 const collections = enumToOptions(Collections);
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
+export const GET = async (req: Request) => {
   const jsonDirectory = path.join(process.cwd(), 'database');
 
-  const collection = req.query.collection as Collections;
+  const { searchParams } = new URL(req.url);
+  const collection = searchParams.get('collection') as Collections;
   const validCollections = collections.map((collection) => collection.value);
 
   if (
     typeof collection !== 'string' ||
     !collection ||
     !validCollections.includes(collection)
-  )
-    res.status(400).json({ message: 'Invalid collection' });
+  ) {
+    const error = {
+      message: 'Invalid collection',
+      validCollections,
+    };
+
+    return new NextResponse(JSON.stringify(error), { status: 400 });
+  }
 
   const fileContents = await fs.readFile(
     jsonDirectory + `/${collection}.json`,
     'utf8',
   );
 
-  res.status(200).json(JSON.parse(fileContents));
-}
+  return new NextResponse(fileContents, { status: 200 });
+};

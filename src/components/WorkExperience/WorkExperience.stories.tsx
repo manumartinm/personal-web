@@ -14,10 +14,8 @@ export const Primary: Story = {
   args: {
     company: 'Google',
     description: 'I worked on the Google Search team.',
-    dateInfo: {
-      start: new Date('2019-01-01'),
-      end: new Date('2020-01-01'),
-    },
+    startDate: '2021-01-01',
+    endDate: '2021-12-31',
     badges: [
       {
         name: 'React',
