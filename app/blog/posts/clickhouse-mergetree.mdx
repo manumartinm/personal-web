@@ -24,24 +24,33 @@ This approach solves the **write amplification problem** that traditional system
 
 The C-Store paper ([Stonebraker et al., 2005](https://people.brandeis.edu/~nga/papers/VLDB05.pdf)) established the foundations of columnar storage:
 
-- **Better compression**: Similar data compresses better together
-- **Selective I/O**: Only read the columns you need
-- **Vectorization**: SIMD operations over homogeneous arrays
+In practice, the benefits are pretty straightforward: **better compression** (similar data compresses better together), **selective I/O** (you only read the columns you need), and **vectorization** (SIMD operations over homogeneous arrays).
 
 ### Sparse Indexing
 
 Unlike traditional dense indexes, ClickHouse uses a **sparse primary index**. The high-level idea (indexing blocks, not rows) is common in LSM/SSTable systems (e.g., [Chang et al., 2006](https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf)) and is documented clearly in ClickHouse’s own docs ([ClickHouse, n.d.-b](https://clickhouse.com/docs/optimize/sparse-primary-indexes)).
 
-- **Dense index**: One entry per row → O(N) memory
-- **Sparse index**: One entry every 8192 rows → O(N/8192) memory
+A dense index stores one entry per row (\(O(N)\) memory). A sparse index stores one entry per granule, e.g. every 8192 rows (\(O(N/8192)\) memory).
 
 For a billion-row table, this means 122K index entries vs 1B. The difference is abysmal.
 
-## Let's get to code
+## Code Deep Dive: From data structures to the end-to-end flow
 
-After studying these papers and working with ClickHouse in production, I built my own implementation with the help of Claude Code. Here are the key decisions:
+After studying these papers and working with ClickHouse in production, I built my own minimal implementation with the help of Claude Code. I’ll start with the key design decisions, and then connect them to the full write/read/merge flow.
 
-### 1. Basic Data Structures: Rows and Granules
+One very important thing about LSM designs is this: **writes are cheap because we append immutable sorted data**, and then we pay the cost later by compacting/merging parts in the background ([O’Neil et al., 1996](https://www.cs.umb.edu/~poneil/lsmtree.pdf)).
+
+Here’s the mental model of the implementation:
+
+```
+INSERT → MemTable (sorted in RAM) → FLUSH → Part on disk (immutable)
+QUERY  → MemTable + relevant Parts → merge results → deduplicate
+MERGE  → pick Parts → k-way merge → new bigger Part → remove old Parts
+```
+
+### Key design decisions
+
+#### Basic data structures: rows and granules
 
 ```cpp
 struct Row {
@@ -56,13 +65,11 @@ struct Row {
 };
 ```
 
-**Granules** are blocks of 8192 rows—the size ClickHouse found optimal after years of production tuning:
+Granules are blocks of 8192 rows—the size ClickHouse found optimal after years of production tuning:
 
-- Index overhead (too small → many entries)
-- Query selectivity (too large → read irrelevant data)
-- Efficient memory mapping (OS page size alignment)
+If the block is too small you pay index overhead (too many entries); if it’s too large you lose selectivity (you read more irrelevant data). The size also plays nicely with efficient memory mapping (think OS page size alignment and sequential access).
 
-### 2. MemTable with Skip Lists: Probabilistic Elegance
+#### MemTable: skip lists
 
 ```cpp
 class MemTable {
@@ -77,15 +84,11 @@ public:
 };
 ```
 
-I chose **skip lists** over B-trees because:
-
-1. **Concurrency**: Skip lists are inherently more thread-friendly
-2. **Simplicity**: Fewer corner cases, fewer bugs
-3. **Memory locality**: Better for write-heavy workloads
+I chose **skip lists** over B-trees because they’re inherently more thread-friendly, they have fewer corner cases (which matters a lot in a small “learn by building” project), and they tend to have decent memory locality in write-heavy workloads.
 
 Pugh’s original paper is still a great read ([Pugh, 1990](ftp://ftp.cs.umd.edu/pub/skipLists/skiplists.pdf)).
 
-### 3. Columnar Storage: The MergeTree Magic
+#### On-disk layout: immutable parts + columnar files
 
 Each **Part** is immutable and stores data in columnar format:
 
@@ -101,7 +104,7 @@ part_001/
 
 This organization enables what C-Store called **late materialization**: you only reconstruct full rows when you actually need them ([Stonebraker et al., 2005](https://people.brandeis.edu/~nga/papers/VLDB05.pdf)).
 
-### 4. Merge Algorithm: K-Way Merge with Priority Queue
+#### Merge algorithm: k-way merge with a priority queue
 
 ```cpp
 class MergeIterator {
@@ -115,95 +118,33 @@ public:
 };
 ```
 
-The merge algorithm is a classic **k-way merge** using a heap. While conceptually simple, the decisions of _when_ to merge are complex. My implementation uses simple heuristics, but in production ClickHouse has sophisticated algorithms that balance:
-
-- **Write amplification** (don't merge too frequently)
-- **Read amplification** (don't have too many parts)
-- **Space amplification** (temporary storage during merges)
-
-### 5. Compression is Critical
-
-My implementation has no compression, but in production it’s **fundamental**. ClickHouse supports multiple codecs (see the docs: [ClickHouse, n.d.-c](https://clickhouse.com/docs/sql-reference/statements/create/table#column-compression-codecs)), and the common theme is always the same: trade CPU for I/O.
-
-- **LZ4**: Fast, decent ratio
-- **ZSTD**: Better compression, more CPU
-- **Specialized codecs**: Delta, DoubleDelta, Gorilla for time series
+The merge algorithm is a classic **k-way merge** using a heap. While conceptually simple, the decisions of _when_ to merge are complex: you’re constantly balancing **write amplification** (don’t merge too frequently), **read amplification** (don’t end up with too many parts), and **space amplification** (merges need temporary storage).
 
 At Tinybird we saw 10:1 ratios or better on real data.
 
-## Performance Analysis: Real Numbers
+### End-to-end flow
 
-My implementation achieves:
+#### The invariants (what must always be true)
 
-```
-Insert performance: 13,970 rows/sec (single-threaded)
-Query performance: 316 rows/μs scanning
-Memory efficiency: 1.3 MB for 50K rows with 50 parts
-Storage overhead: ~42 bytes per row (before compression)
-```
+There are three invariants I try to keep in mind. First, **everything we query efficiently is sorted by the same order** (in my case, primary key + timestamp), which is what makes range queries and merges simple. Second, **on-disk data is immutable**: once a `Part` is written, we never update it in place; new versions come from new parts (flush or merge). Third, **each part has a sparse index** (one entry per granule, not per row), which is the trick that keeps index size and memory usage under control (see also: [ClickHouse, n.d.-b](https://clickhouse.com/docs/optimize/sparse-primary-indexes)).
 
-For context, ClickHouse in production can do:
+#### Write path (INSERT → MemTable → FLUSH → Part)
 
-- **Inserts**: 100M+ rows/sec (multi-threaded, clustered)
-- **Queries**: GB/sec scanning rates
-- **Compression**: 10-20x reduction vs raw data
+Insert hits the MemTable. The MemTable is an in-memory ordered structure (skip list). That means inserts are cheap-ish (\(O(\log n)\) expected) and, crucially, the MemTable can give you rows already sorted when it’s time to flush.
 
-## Code Deep Dive: How It Actually Works
-
-One very important thing about LSM designs is this: **writes are cheap because we append immutable sorted data**, and then we pay the cost later by compacting/merging parts in the background ([O’Neil et al., 1996](https://www.cs.umb.edu/~poneil/lsmtree.pdf)).
-
-Here’s the mental model of the implementation:
-
-```
-INSERT → MemTable (sorted in RAM) → FLUSH → Part on disk (immutable)
-QUERY  → MemTable + relevant Parts → merge results → deduplicate
-MERGE  → pick Parts → k-way merge → new bigger Part → remove old Parts
-```
-
-### 0. The invariants (what must always be true)
-
-- **Sorted order**: every structure we query efficiently is sorted by the same order (in my case, primary key + timestamp). This is what makes range queries and merges simple.
-- **Immutability on disk**: once a `Part` is written, we never update it in place. If we need a “new version”, we create a new `Part` (via flush or merge).
-- **A sparse index per part**: not “one entry per row”, but “one entry per granule”. This is the key trick that keeps memory/index size low (see also: [ClickHouse, n.d.-b](https://clickhouse.com/docs/optimize/sparse-primary-indexes)).
-
-### 1. Write path (INSERT → MemTable → FLUSH → Part)
-
-**Step A: Insert hits the MemTable.**  
-The MemTable is an in-memory ordered structure (skip list). That means inserts are cheap-ish (\(O(\log n)\) expected) and, crucially, **the MemTable can give you rows already sorted** when it’s time to flush.
-
-**Step B: When MemTable is “big enough”, we flush.**  
-Flush is the moment where we turn RAM state into an immutable on-disk `Part`. Conceptually the steps are:
-
-- **Snapshot sorted rows** from MemTable (so we freeze a consistent view).
-- **Split into granules** of fixed size (8192 rows in my implementation).
-- **Write columns** for each granule (`keys`, `values`, `timestamps`) to separate `.bin` files.
-- **Build the sparse index** (`primary.idx`) with one entry per granule (typically min/max key per granule).
-- **Register the part** in the MergeTree’s list of parts.
+When MemTable is “big enough”, we flush. Flush is the moment where we turn RAM state into an immutable on-disk `Part`: we snapshot the sorted rows from MemTable (to freeze a consistent view), split them into fixed-size granules (8192 rows in my implementation), write each column to its own `.bin` file, build a sparse index (`primary.idx`) with one entry per granule (typically min/max key), and finally register the part in the MergeTree’s list of parts.
 
 The important insight: flushing creates **more parts**. That’s fine for writes, but it increases the number of files/segments a query might have to look at (read amplification). That’s why merges exist.
 
-### 2. What exactly is inside a Part?
+#### What exactly is inside a Part?
 
-A `Part` is basically:
+A `Part` is the immutable on-disk unit: a set of granules (fixed-size blocks of rows), per-granule column files (so you can read only what you need), and a sparse primary index that tells you which granules might overlap a query range. This is a tiny but very practical approximation of ClickHouse’s “parts + marks” idea: don’t index every row; index blocks.
 
-- **A set of granules** (fixed-size blocks of rows).
-- **Per-granule column files** (columnar layout): you can read only what you need.
-- **A sparse primary index** to quickly decide which granules might overlap your query range.
-
-This is a tiny but very practical approximation of ClickHouse’s “parts + marks” idea: don’t index every row; index blocks.
-
-### 3. Read path (QUERY → prune parts → prune granules → scan)
+#### Read path (QUERY → prune parts → prune granules → scan)
 
 When you do a range query `[start_key, end_key]`, the engine does three levels of “filtering” before it reads data:
 
-**Level 1: MemTable (fresh writes).**  
-Always check MemTable because it contains the newest rows that might not have been flushed yet.
-
-**Level 2: Part-level pruning.**  
-Each part can be skipped quickly if its global min/max key doesn’t overlap the requested range.
-
-**Level 3: Granule-level pruning (sparse index).**  
-Inside a part, we don’t scan everything. We ask the sparse index which granules _might_ overlap:
+First, you always check MemTable because it contains the newest rows that might not have been flushed yet. Then you do **part-level pruning**: skip parts whose global min/max key doesn’t overlap your requested range. Finally, inside each remaining part you do **granule-level pruning** using the sparse index: you only scan granules that _might_ overlap:
 
 ```cpp
 bool IndexEntry::overlaps_range(const std::string& start_key,
@@ -214,41 +155,29 @@ bool IndexEntry::overlaps_range(const std::string& start_key,
 
 Then we only load/scan those granules. In a “real” column store, this is also where the engine decides **which columns** to read. My minimal version reads the columns needed to reconstruct `Row` objects for results.
 
-### 4. Merging query results (why we “merge and dedup”)
+#### Merging query results (why we “merge and dedup”)
 
 Because we never update parts in place, you can have multiple versions of the “same logical key” across different parts (and also in the MemTable).
 
-So the final query result is:
-
-- **Merge** the sorted streams (MemTable + each part’s results) into one sorted stream.
-- **Deduplicate** by key/versioning rule (in this project: keep the latest by `timestamp`).
+So the final query result comes from two operations: you **merge** the sorted streams (MemTable + each part’s results) into one sorted stream, and then you **deduplicate** by your versioning rule (in this project: keep the latest by `timestamp`).
 
 My code currently does this in a very simple way by concatenating results, sorting, and `unique`-ing. It’s not the most efficient approach, but it’s conceptually clean for an educational implementation. A production engine would do this as a streaming merge of already-sorted iterators to avoid extra memory/sorts.
 
-### 5. Background merges (why we compact parts at all)
+#### Background merges (why we compact parts at all)
 
 Every flush adds a new part. If we never merge, reads get slower because:
 
-- you have to check more parts,
-- you might have to scan more granules,
-- you do more merging/dedup work at query time.
+you have to check more parts, you might have to scan more granules, and you do more merge/dedup work at query time.
 
 So merges (compactions) trade **write amplification** for lower **read amplification**:
 
-- Pick a few candidate parts (heuristics: size tiers, number of parts, etc.).
-- Do a **k-way merge** of their rows (because each part is sorted).
-- Apply the same dedup rule (keep the newest version).
-- Write out a **new bigger part** and drop the old ones.
+pick a few candidate parts (heuristics: size tiers, number of parts, etc.), do a **k-way merge** of their rows (because each part is sorted), apply the same dedup rule (keep the newest version), write out a **new bigger part**, and drop the old ones.
 
 The “k-way merge” is the classic algorithmic core: you keep a min-heap with the current head row of each input part, pop the smallest, advance that input, repeat. That’s exactly the same shape you’d use in merge sort—just generalized to \(k\) inputs.
 
-### 6. A tiny worked example (with numbers)
+#### A tiny worked example (with numbers)
 
-To make the flow tangible, let’s pretend:
-
-- the **granule size is 4 rows** (instead of 8192),
-- the sort order is **(key, timestamp)**,
-- and the “versioning rule” is **latest timestamp wins**.
+To make the flow tangible, let’s pretend the granule size is 4 rows (instead of 8192), the sort order is (key, timestamp), and the “versioning rule” is “latest timestamp wins”.
 
 Now we insert these rows (same key can appear multiple times):
 
@@ -260,7 +189,7 @@ Now we insert these rows (same key can appear multiple times):
 | 4            | `c` | `v1`  | 13  |
 | 5            | `b` | `v2`  | 20  |
 
-**After inserts 1..4**, MemTable hits the flush threshold and we write **Part_1**.
+After inserts 1..4, MemTable hits the flush threshold and we write Part_1.
 Because MemTable is ordered, the flushed rows are already sorted:
 
 ```
@@ -268,7 +197,7 @@ Part_1 rows (sorted):
 (a,10) (a,12) (b,11) (c,13)
 ```
 
-**Insert 5** stays in MemTable for now:
+Insert 5 stays in MemTable for now:
 
 ```
 MemTable:
@@ -277,9 +206,7 @@ MemTable:
 
 Now query the range `[a, b]`:
 
-- MemTable returns `(b,20)`
-- Part_1 returns `(a,10) (a,12) (b,11)`
-- merge + dedup keeps the newest version per key:
+MemTable returns `(b,20)`, Part_1 returns `(a,10) (a,12) (b,11)`, and merge + dedup keeps the newest version per key:
 
 ```
 Result:
@@ -289,7 +216,7 @@ b → (b,20)
 
 This example is basically the whole system in miniature: **immutability creates duplicates across structures**, and the engine resolves them by merging and applying a “latest wins” rule.
 
-### 7. A “drawing” of the system (what lives where)
+#### A “drawing” of the system (what lives where)
 
 Here’s the physical picture of one `Part` on disk in my project:
 
@@ -318,12 +245,14 @@ query(start_key, end_key)
   └─ merge + dedup across all sources
 ```
 
-### 8. Math notes (simple but useful)
+### Notes & further reading
 
-**Skip list insert (MemTable).**  
+#### Math notes (simple but useful)
+
+Skip list insert (MemTable).  
 Expected insertion/search cost is \(O(\log n)\). With promotion probability \(p = 0.5\), the expected number of levels per node is constant, so you get a fast ordered structure without explicit rebalancing ([Pugh, 1990](ftp://ftp.cs.umd.edu/pub/skipLists/skiplists.pdf)).
 
-**Sparse index size.**  
+Sparse index size.  
 If a part has \(N\) rows and granule size \(S\), the number of index entries is:
 
 \[
@@ -332,7 +261,7 @@ E = \left\lceil \frac{N}{S} \right\rceil
 
 So compared to a dense index (\(N\) entries), you reduce it by roughly a factor of \(S\) (8192 in my “real” implementation).
 
-**K-way merge cost.**  
+K-way merge cost.  
 If you merge \(k\) sorted inputs with total \(R\) rows, heap-based k-way merge is:
 
 \[
@@ -341,7 +270,7 @@ O(R \log k)
 
 That’s why having too many parts (large \(k\)) hurts reads, and why compaction/merges matter.
 
-**A tiny cost model (intuition, not a proof).**  
+A tiny cost model (intuition, not a proof).  
 For a range query, you can think:
 
 \[
@@ -356,14 +285,22 @@ Where:
 
 Merges aim to reduce \(P\) (and usually \(R\) for the same logical query) at the cost of doing extra work in the background.
 
-### 9. Links worth reading (if you want to go deeper)
+## Performance Analysis: Real Numbers
 
-- MergeTree family overview: [ClickHouse, n.d.-a](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree)
-- Sparse primary index: [ClickHouse, n.d.-b](https://clickhouse.com/docs/optimize/sparse-primary-indexes)
-- LSM paper: [O’Neil et al., 1996](https://www.cs.umb.edu/~poneil/lsmtree.pdf)
-- Bigtable (SSTables + compactions): [Chang et al., 2006](https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf)
-- RocksDB compaction wiki: [Facebook, n.d.](https://github.com/facebook/rocksdb/wiki/Compaction)
-- Designing Data-Intensive Applications: [Kleppmann, 2017](https://dataintensive.net/)
+My implementation achieves:
+
+```
+Insert performance: 13,970 rows/sec (single-threaded)
+Query performance: 316 rows/μs scanning
+Memory efficiency: 1.3 MB for 50K rows with 50 parts
+Storage overhead: ~42 bytes per row (before compression)
+```
+
+For context, ClickHouse in production can do:
+
+- **Inserts**: 100M+ rows/sec (multi-threaded, clustered)
+- **Queries**: GB/sec scanning rates
+- **Compression**: 10-20x reduction vs raw data
 
 ## Running the Implementation
 
@@ -415,11 +352,21 @@ Performance test completed successfully!
 
 ## The Code and Beyond
 
-My complete implementation (~2000 lines) is available on GitHub with full documentation: [manumartinm/clickhouse-mergetree](https://github.com/manumartinm/clickhouse-mergetree). It's educational, not production-ready, but demonstrates that **fundamental concepts** can be expressed relatively simply.
+My complete implementation (~2000 lines) is available on GitHub with full documentation: [manumartinm/clickhouse-mergetree](https://github.com/manumartinm/clickhouse-mergetree).
 
-For real workloads, use mature systems like ClickHouse, DuckDB, or platforms like Tinybird that abstract all this complexity. But understanding what happens underneath makes you a better engineer.
+## Further Reading
 
-## References
+Chang, F., Dean, J., Ghemawat, S., Hsieh, W. C., Wallach, D. A., Burrows, M., Chandra, T., Fikes, A., & Gruber, R. E. (2006). [_Bigtable: A distributed storage system for structured data_](https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf).
+
+ClickHouse. (n.d.-a). [_MergeTree_ (table engine)](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree). Retrieved January 11, 2026.
+
+ClickHouse. (n.d.-b). [_Sparse primary indexes_](https://clickhouse.com/docs/optimize/sparse-primary-indexes). Retrieved January 11, 2026.
+
+Facebook. (n.d.). [_Compaction_](https://github.com/facebook/rocksdb/wiki/Compaction). RocksDB Wiki. Retrieved January 11, 2026.
+
+Kleppmann, M. (2017). [_Designing data-intensive applications_](https://dataintensive.net/). O’Reilly Media.
+
+O’Neil, P., Cheng, E., Gawlick, D., & O’Neil, E. (1996). [_The log-structured merge-tree (LSM-tree)_](https://www.cs.umb.edu/~poneil/lsmtree.pdf).
 
 Chang, F., Dean, J., Ghemawat, S., Hsieh, W. C., Wallach, D. A., Burrows, M., Chandra, T., Fikes, A., & Gruber, R. E. (2006). [_Bigtable: A distributed storage system for structured data_](https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf). In _Proceedings of the 7th USENIX Symposium on Operating Systems Design and Implementation (OSDI ’06)_.
 
