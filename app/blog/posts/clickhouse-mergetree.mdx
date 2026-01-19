@@ -6,7 +6,9 @@ summary: Reflections from working at Tinybird processing millions of events per 
 
 Yesterday I was a bit tired of studying, so I opened my editor and hacked together a small C++ project to understand the internals of ClickHouse a little better.
 
-I’ve used ClickHouse a lot at Tinybird (and earlier at Keytrends), and I’ve always had that engineer curiosity: **what if I implement a tiny version of MergeTree from scratch?** Just to learn the fundamentals.
+I’ve used ClickHouse a lot at [Tinybird](https://www.tinybird.co/) (a real-time analytics database built on top of ClickHouse, with our own internal fork). In practice that means I’ve spent a lot of time not just running ClickHouse-based systems at production scale, but also tuning and extending ClickHouse for real workloads (ingestion patterns, merge/compaction behavior, and query performance). These days I’m working on billing, but ClickHouse is still very much “home turf”. Earlier, I also used ClickHouse at Keytrends.
+
+I’ve always had that engineer curiosity: what if I implement a tiny version of MergeTree from scratch? Just to learn the fundamentals.
 
 So I built a minimal (but functional) MergeTree-like engine in C++ (the code is on GitHub: [manumartinm/clickhouse-mergetree](https://github.com/manumartinm/clickhouse-mergetree)). In this post, I’ll explain the ideas behind it, the trade-offs, and how the end-to-end flow works.
 
@@ -19,6 +21,8 @@ The **LSM-Tree** (Log-Structured Merge-Tree) concept was introduced in the class
 > _Instead of updating data in-place like traditional B-trees, keep data in immutable structures and merge periodically_
 
 This approach solves the **write amplification problem** that traditional systems suffer from. In a B-tree, a single write can generate multiple random I/Os. In an LSM-tree, all writes are sequential.
+
+ClickHouse’s **MergeTree** engine family isn’t a “textbook LSM-tree”, but it shares a lot of the same high-level shape: data lands in immutable on-disk parts, and the system continuously merges (compacts) those parts in the background to keep reads fast ([ClickHouse, n.d.-a](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree); [O’Neil et al., 1996](https://www.cs.umb.edu/~poneil/lsmtree.pdf)).
 
 ### Column Stores
 
@@ -36,7 +40,7 @@ For a billion-row table, this means 122K index entries vs 1B. The difference is 
 
 ## Code Deep Dive: From data structures to the end-to-end flow
 
-After studying these papers and working with ClickHouse in production, I built my own minimal implementation with the help of Claude Code. I’ll start with the key design decisions, and then connect them to the full write/read/merge flow.
+After studying these papers and working with ClickHouse in production at [Tinybird](https://www.tinybird.co/) (where we build a ClickHouse-based real-time analytics database on an internal fork, and routinely need to reason about — and tune — MergeTree behavior: parts, merges/compaction, and query performance), I built my own minimal implementation with the help of Claude Code. I’ll start with the key design decisions, and then connect them to the full write/read/merge flow.
 
 One very important thing about LSM designs is this: **writes are cheap because we append immutable sorted data**, and then we pay the cost later by compacting/merging parts in the background ([O’Neil et al., 1996](https://www.cs.umb.edu/~poneil/lsmtree.pdf)).
 
@@ -119,8 +123,6 @@ public:
 ```
 
 The merge algorithm is a classic **k-way merge** using a heap. While conceptually simple, the decisions of _when_ to merge are complex: you’re constantly balancing **write amplification** (don’t merge too frequently), **read amplification** (don’t end up with too many parts), and **space amplification** (merges need temporary storage).
-
-At Tinybird we saw 10:1 ratios or better on real data.
 
 ### End-to-end flow
 
@@ -274,7 +276,7 @@ A tiny cost model (intuition, not a proof).
 For a range query, you can think:
 
 \[
-T \approx c*0 \cdot P + c_1 \cdot \sum*{p=1}^{P} E_p + c_2 \cdot R
+T \approx c_0 \cdot P + c_1 \cdot \sum_{p=1}^{P} E_p + c_2 \cdot R
 \]
 
 Where:
@@ -282,6 +284,7 @@ Where:
 - \(P\) = number of parts you “touch”,
 - \(E_p\) = index entries scanned/checked in each part (worst-case; in practice you can binary search),
 - \(R\) = total rows actually scanned/returned.
+- \(c_0, c_1, c_2\) = constant factors for part pruning, index work, and row scanning.
 
 Merges aim to reduce \(P\) (and usually \(R\) for the same logical query) at the cost of doing extra work in the background.
 
@@ -354,19 +357,7 @@ Performance test completed successfully!
 
 My complete implementation (~2000 lines) is available on GitHub with full documentation: [manumartinm/clickhouse-mergetree](https://github.com/manumartinm/clickhouse-mergetree).
 
-## Further Reading
-
-Chang, F., Dean, J., Ghemawat, S., Hsieh, W. C., Wallach, D. A., Burrows, M., Chandra, T., Fikes, A., & Gruber, R. E. (2006). [_Bigtable: A distributed storage system for structured data_](https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf).
-
-ClickHouse. (n.d.-a). [_MergeTree_ (table engine)](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree). Retrieved January 11, 2026.
-
-ClickHouse. (n.d.-b). [_Sparse primary indexes_](https://clickhouse.com/docs/optimize/sparse-primary-indexes). Retrieved January 11, 2026.
-
-Facebook. (n.d.). [_Compaction_](https://github.com/facebook/rocksdb/wiki/Compaction). RocksDB Wiki. Retrieved January 11, 2026.
-
-Kleppmann, M. (2017). [_Designing data-intensive applications_](https://dataintensive.net/). O’Reilly Media.
-
-O’Neil, P., Cheng, E., Gawlick, D., & O’Neil, E. (1996). [_The log-structured merge-tree (LSM-tree)_](https://www.cs.umb.edu/~poneil/lsmtree.pdf).
+## References
 
 Chang, F., Dean, J., Ghemawat, S., Hsieh, W. C., Wallach, D. A., Burrows, M., Chandra, T., Fikes, A., & Gruber, R. E. (2006). [_Bigtable: A distributed storage system for structured data_](https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf). In _Proceedings of the 7th USENIX Symposium on Operating Systems Design and Implementation (OSDI ’06)_.
 
