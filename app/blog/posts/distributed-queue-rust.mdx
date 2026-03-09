@@ -1,0 +1,274 @@
+---
+title: "Building a Kafka-Style Distributed Queue in Rust from Scratch"
+publishedAt: "2026-03-09"
+summary: "A practical deep dive into implementing a distributed message queue in Rust: WAL segments, partition replication, ZooKeeper coordination, consumer groups, and real failure handling trade-offs."
+---
+
+I like building infrastructure systems from scratch when I want to really understand them.
+
+That was the motivation behind this project: implement a distributed message queue in Rust with the same core shape as Kafka, but small enough to reason about end to end. Not a production replacement for Kafka, and not a toy either. The goal was to force myself to confront the hard parts directly: durable logs, replication lag, stale leaders, rebalances, and crash recovery.
+
+The full implementation is available on GitHub: [manumartinm/rust-queue-system](https://github.com/manumartinm/rust-queue-system).
+
+In this post, I will walk through the design, the data flow, and the trade-offs. I will also include a tiny worked example so the write/read/replicate path feels concrete.
+
+## Academic Fundamentals: Why this architecture exists
+
+### The log-structured idea behind modern queues
+
+The central idea is simple: write records sequentially to an append-only log, and build everything else around it. This is the same family of ideas that appears in Kafka and in many log-structured storage systems ([Kreps et al., 2011](https://notes.stephenholiday.com/Kafka.pdf); [O’Neil et al., 1996](https://www.cs.umb.edu/~poneil/lsmtree.pdf)).
+
+Sequential appends are fast, predictable, and SSD-friendly. The hard part moves to background work and coordination: replication, retention, and consistency boundaries.
+
+### Partitioning as a scalability primitive
+
+A single log can preserve strict order, but it cannot scale linearly forever. Partitioning solves that by splitting a topic into independent ordered logs. Ordering stays guaranteed inside each partition, not globally across all partitions ([Apache Kafka, n.d.-a](https://kafka.apache.org/documentation/#design)).
+
+### Why ZooKeeper in this implementation
+
+Kafka has moved toward KRaft, but this project uses ZooKeeper because it keeps the coordination model explicit and educational: ephemeral membership, controller election, watches, and centralized metadata paths ([Hunt et al., 2010](https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf); [Apache Kafka, n.d.-b](https://kafka.apache.org/documentation/#zookeeper)).
+
+## Architecture Overview: Components and flow
+
+At a high level, the system has three planes:
+
+- data plane: partition leaders/followers and local WALs
+- control plane: ZooKeeper metadata + controller decisions
+- consumer plane: consumer groups, offsets, and rebalancing
+
+This is the mental model:
+
+```text
+                 Producers
+                     |
+                  gRPC API
+                     |
+      +--------------+--------------+
+      |                             |
+   Broker A                      Broker B ... Broker N
+   Leader P0,P3                  Leader P1,P2
+   Follower P1                   Follower P0
+      +--------------+--------------+
+                     |
+                 ZooKeeper
+          (members, controller, state)
+                     |
+               Consumer Groups
+```
+
+Each partition has exactly one leader at a time. Producers write to that leader. Followers pull data from the leader and advance their replica offsets. Consumers read committed data up to a high watermark.
+
+## Code Deep Dive: End-to-end write, replicate, read
+
+### Write-ahead log layout and segments
+
+The WAL is an append-only file per partition, split into segments. Segmenting makes retention and recovery tractable.
+
+```text
+/data/orders/partition-0/
+├── 00000000000000000000.log
+├── 00000000000000000000.index
+├── 00000000000001000000.log
+├── 00000000000001000000.index
+└── ...
+```
+
+Each message is serialized with a checksum:
+
+```text
+[CRC32: 4B][Timestamp: 8B][KeyLen: 4B][Key][ValueLen: 4B][Value]
+```
+
+That CRC check is small but important. During reads and startup recovery, checksum mismatches are treated as corruption and trigger truncation/recovery logic instead of silently serving bad data.
+
+### Sparse index and random access
+
+To fetch by offset efficiently, the engine keeps a sparse index from logical offsets to file positions. We do not index every single record.
+
+If a segment stores \(N\) records and we index every \(S\) records, index size is approximately:
+
+\[
+E = \left\lceil \frac{N}{S} \right\rceil
+\]
+
+Where:
+
+- \(N\): records in segment
+- \(S\): sampling interval
+- \(E\): number of index entries
+
+This gives a practical balance: tiny index memory footprint with fast binary-search-style seeks.
+
+### Replication protocol (leader/follower + ISR)
+
+Each partition keeps one leader and multiple followers. Only the leader accepts writes. Followers replicate in pull mode, periodically fetching from the current leader.
+
+Not every follower is equally healthy. The In-Sync Replica set (ISR) contains replicas that are sufficiently caught up. The commit boundary (high watermark) is the minimum replicated offset among ISR members:
+
+\[
+HW = \min_{r \in ISR}\ \text{offset}(r)
+\]
+
+Consumers only read up to HW. This prevents exposing uncommitted records that could be lost on leader failover.
+
+### Epoch fencing and split-brain prevention
+
+Leader epochs are crucial. If a previously isolated broker comes back and still thinks it is leader, stale writes must be rejected. The request epoch is compared against the current leader epoch, and stale requests fail fast.
+
+This one mechanism prevents a large class of split-brain bugs.
+
+### ZooKeeper metadata structure
+
+ZooKeeper stores live broker membership, controller ownership, partition leadership state, and consumer metadata. A representative shape:
+
+```text
+/brokers/ids/{id}
+/brokers/topics/{topic}/partitions/{p}/state
+/controller
+/consumers/groups/{group}/offsets/{topic}/{partition}
+```
+
+Ephemeral nodes and watches make failure detection and topology updates straightforward to reason about in this style of design.
+
+### Consumer groups and rebalance behavior
+
+Consumer groups allow horizontal read scaling while preserving per-partition single ownership inside a group.
+
+A tiny rebalance example:
+
+```text
+Topic payments has 3 partitions: P0, P1, P2
+
+Before:
+  C1 -> P0, P1
+  C2 -> P2
+
+After C3 joins:
+  C1 -> P0
+  C2 -> P1
+  C3 -> P2
+```
+
+Ownership changes, but committed offsets remain per partition, so processing can resume from known points.
+
+### Tiny worked example: write, replicate, read
+
+Let us make the flow concrete with a small queue:
+
+```text
+Topic orders, 2 partitions (P0, P1), replication factor 2
+
+Leader map:
+  P0 -> Broker A (follower B)
+  P1 -> Broker B (follower A)
+```
+
+Now we produce 5 events with key-based partitioning:
+
+| event | key      | hash(key) % 2 | partition |
+| ----- | -------- | ------------- | --------- |
+| e1    | user-10  | 0             | P0        |
+| e2    | user-77  | 1             | P1        |
+| e3    | user-10  | 0             | P0        |
+| e4    | user-31  | 1             | P1        |
+| e5    | user-10  | 0             | P0        |
+
+For `P0`, leader A appends offsets 0, 1, 2 in order. Follower B pulls and catches up to offset 2. For `P1`, leader B appends offsets 0, 1 and follower A catches up.
+
+If `P0` high watermark is 2, consumers can safely read offsets 0..2 from `P0`. If follower B lags and ISR shrinks, HW may stop advancing even if the leader keeps appending locally. That is the correctness/performance trade-off in action.
+
+## Failure Handling: where systems become real
+
+### Broker failure
+
+If a leader broker fails, controller logic selects a new leader from ISR, increments epoch, updates metadata, and clients retry against the new leader. Safety depends on not electing out-of-sync replicas as leaders.
+
+### Network partition
+
+When a partitioned old leader comes back, epoch checks reject stale produce requests. This is the fence that keeps histories from diverging.
+
+### Data corruption
+
+On checksum mismatch, the recovery strategy is:
+
+1. detect corruption offset
+2. truncate to last valid position
+3. if follower, re-fetch missing tail from leader
+4. if leader, continue from safe point and let followers catch up
+
+This policy favors bounded damage and fast return to service.
+
+## Performance Notes: what dominated in practice
+
+The strongest pattern in benchmarks is storage-sync behavior. `fsync` policy dominates throughput.
+
+Representative shape from this implementation:
+
+- immediate flush per message: low throughput, stronger durability
+- batched flush: order-of-magnitude higher throughput
+- sequential fetches: much faster than random access patterns
+
+The simplified math behind it:
+
+\[
+T_{single} \approx \frac{1}{t_f}, \qquad
+T_{batch} \approx \frac{B}{t_f}
+\]
+
+Where:
+
+- \(t_f\): average flush/sync cost
+- \(B\): batch size
+- \(T\): rough throughput bound from sync behavior
+
+This is not a full model, but it explains why batching changes everything.
+
+## Trade-offs: write, read, and space amplification
+
+Like any log-structured system, this queue lives in a three-way trade-off:
+
+- write amplification: replication and recovery write extra bytes
+- read amplification: many segments/partitions increase read work
+- space amplification: temporary duplicate data during failover/recovery
+
+You cannot optimize all three at once. You choose based on workload and SLOs:
+
+- lower latency and stronger durability usually cost throughput
+- higher throughput usually needs batching and looser commit timing
+- aggressive retention and compaction policies change disk and read pressure
+
+## What I learned implementing this
+
+Three lessons stood out:
+
+First, distributed queues are mostly about failure semantics, not API design. Happy-path produce/fetch is easy.
+
+Second, simple mechanisms like leader epochs and high watermarks give huge safety wins if applied consistently.
+
+Third, Rust is a very good fit here. Ownership rules and type discipline remove many race-condition and lifetime bugs before runtime.
+
+## Next steps for this queue
+
+The roadmap is straightforward:
+
+- compression (Snappy/LZ4)
+- log compaction for key-based topics
+- idempotent producers and stronger delivery semantics
+- better observability (ISR churn, lag histograms, rebalance timing)
+- migration from ZooKeeper-style coordination to embedded Raft
+
+## References
+
+Apache Kafka. (n.d.-a). [Kafka documentation: Design](https://kafka.apache.org/documentation/#design). Retrieved March 9, 2026.
+
+Apache Kafka. (n.d.-b). [Kafka documentation: ZooKeeper and migration context](https://kafka.apache.org/documentation/#zookeeper). Retrieved March 9, 2026.
+
+Hunt, P., Konar, M., Junqueira, F. P., & Reed, B. (2010). [ZooKeeper: Wait-free coordination for Internet-scale systems](https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf). *USENIX ATC*.
+
+Kreps, J., Narkhede, N., & Rao, J. (2011). [Kafka: A distributed messaging system for log processing](https://notes.stephenholiday.com/Kafka.pdf). *NetDB*.
+
+Kleppmann, M. (2017). [Designing Data-Intensive Applications](https://dataintensive.net/). O’Reilly Media.
+
+O’Neil, P., Cheng, E., Gawlick, D., & O’Neil, E. (1996). [The log-structured merge-tree (LSM-tree)](https://www.cs.umb.edu/~poneil/lsmtree.pdf).
+
+Martin, M. (2026). [rust-queue-system](https://github.com/manumartinm/rust-queue-system) [Source code]. GitHub.
