@@ -1,0 +1,318 @@
+---
+title: "Making Matrix Multiplication Fast: From Naive Loops to AVX2, and Why Neural Networks Care"
+publishedAt: "2026-04-06"
+summary: "A hands-on journey through optimizing GEMM in C++17 — cache blocking, AVX2 intrinsics, OpenMP parallelism — and how every dense layer in a neural network is just a matrix multiply in disguise."
+---
+
+Every time a neural network runs a forward pass through a dense layer, it multiplies matrices. Every backpropagation step multiplies more matrices. A single training epoch on a real model can involve billions of multiply-accumulate operations, and most of them live inside one function: general matrix multiplication, or GEMM.
+
+That realization motivated this project: implement GEMM five different ways in C++, measure what each optimization actually buys you, and connect it all to a working neural network that swaps implementations at runtime. Not a BLAS replacement — a way to see exactly where the performance comes from.
+
+The full implementation is on GitHub: [manumartinm/matrix-multiplication](https://github.com/manumartinm/matrix-multiplication).
+
+## Why matrix multiplication is the bottleneck
+
+### Dense layers are matrix multiplies
+
+A fully connected layer with \(n\) inputs and \(m\) outputs computes:
+
+\[
+Y = X \cdot W^T + b
+\]
+
+Where:
+
+- \(X\): input matrix, shape \((B, n)\) for batch size \(B\)
+- \(W\): weight matrix, shape \((m, n)\)
+- \(b\): bias vector, shape \((m,)\)
+- \(Y\): output, shape \((B, m)\)
+
+That multiplication \(X \cdot W^T\) is a GEMM with \(2 \cdot B \cdot n \cdot m\) floating-point operations. Backpropagation adds two more: computing weight gradients (\(\nabla W = \nabla Y^T \cdot X\)) and propagating error backward (\(\nabla X = \nabla Y \cdot W\)).
+
+Three matrix multiplications per dense layer per training step. In a network with multiple layers, GEMM dominates compute time — often 80–90% of the total ([Jia et al., 2018](https://arxiv.org/abs/1802.06991)).
+
+### The arithmetic intensity problem
+
+Naive matrix multiplication of two \(N \times N\) matrices performs \(2N^3\) FLOPs but touches \(3N^2\) floats. The arithmetic intensity (FLOPs per byte of memory traffic) is:
+
+\[
+I = \frac{2N^3}{3N^2 \cdot 4} = \frac{N}{6}
+\]
+
+For \(N = 1024\), that gives \(I \approx 170\) FLOPs/byte — well into the compute-bound regime. But only if you can actually keep the data in cache. Without cache-aware access patterns, you are memory-bound long before you hit the CPU's peak FLOP rate.
+
+This is what motivates every optimization in the project.
+
+## Architecture: pluggable implementations
+
+The system defines a simple function pointer type that every implementation shares:
+
+```cpp
+using MatMulFunc = void(*)(const Matrix& A, const Matrix& B, Matrix& C);
+```
+
+Five implementations conform to this interface: `naive`, `blocked`, `simd`, `parallel`, and `optimized`. The neural network's `DenseLayer` accepts a `MatMulFunc` at construction, so you can swap the GEMM backend without touching the network code:
+
+```cpp
+DenseLayer(size_t input_size, size_t output_size,
+           MatMulFunc impl = matmul::optimized);
+```
+
+This design makes benchmarking trivial: train the same XOR network with each implementation and compare wall-clock time.
+
+```text
+MatMulFunc (function pointer)
+       │
+       ├── matmul::naive        (baseline)
+       ├── matmul::blocked      (cache tiling)
+       ├── matmul::simd         (AVX2 intrinsics)
+       ├── matmul::parallel     (OpenMP threads)
+       └── matmul::optimized    (AVX2 + OpenMP + K-unrolling)
+       │
+       ▼
+ DenseLayer::forward()    →  input × weights^T
+ DenseLayer::backward()   →  grad^T × input,  grad × weights
+```
+
+## The optimization progression
+
+### Level 0: naive triple loop
+
+The textbook implementation. Three nested loops, \(O(N^3)\):
+
+```cpp
+for (size_t i = 0; i < M; ++i) {
+    for (size_t j = 0; j < N; ++j) {
+        float sum = 0.0f;
+        for (size_t k = 0; k < K; ++k) {
+            sum += A(i, k) * B(k, j);
+        }
+        C(i, j) = sum;
+    }
+}
+```
+
+The problem is the access pattern for `B`. Walking down column `j` of `B` means jumping `N` floats per step in row-major memory. For a 1024×1024 matrix, that is a 4 KB stride — every access to `B` is a potential cache miss.
+
+At 1024×1024, this runs at roughly 1.27 GFLOPS.
+
+### Level 1: cache blocking (tiling)
+
+The fix is to process the matrices in tiles that fit in cache. Instead of computing one element of `C` at a time, you compute a tile of `C` from tiles of `A` and `B` that are small enough to stay resident.
+
+The implementation uses two levels of tiling: an outer block of 128×128 for L2 cache, and inner tiles of 32×32 for L1:
+
+```cpp
+constexpr size_t L1_TILE = 32;
+
+for (size_t ii = 0; ii < M; ii += tile_size) {
+    for (size_t jj = 0; jj < N; jj += tile_size) {
+        for (size_t kk = 0; kk < K; kk += tile_size) {
+            // Inner L1-sized tiles
+            for (size_t i = ii; i < i_end; i += L1_TILE) {
+                // ... nested inner tiling ...
+                // ikj ordering: sequential B access
+                for (size_t ii_inner = i; ii_inner < i_limit; ++ii_inner) {
+                    for (size_t kk_inner = k; kk_inner < k_limit; ++kk_inner) {
+                        const float a_val = A(ii_inner, kk_inner);
+                        for (size_t jj_inner = j; jj_inner < j_limit; ++jj_inner) {
+                            C(ii_inner, jj_inner) += a_val * B(kk_inner, jj_inner);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Two things matter here beyond the tiling itself. The loop ordering is `ikj`, not `ijk`. With `ikj`, the innermost loop walks `B` and `C` along rows — sequential memory access. And the value `A(i, k)` is loaded once and reused across the entire inner `j` loop, which the compiler can keep in a register.
+
+A 32×32 tile of floats occupies 4 KB. Three such tiles (one from `A`, one from `B`, one for `C`) fit comfortably in the typical 32–48 KB L1 data cache.
+
+### Level 2: AVX2 SIMD
+
+Blocking reduces cache misses. SIMD reduces the number of instructions per element by processing 8 floats in a single operation.
+
+AVX2 gives you 256-bit registers (`__m256`), each holding 8 single-precision floats. The key operation is **fused multiply-add** (FMA): `a × b + c` in a single cycle.
+
+The core inner kernel broadcasts one `A` value across all 8 SIMD lanes, then multiplies it against 32 elements of `B` in four consecutive FMA instructions:
+
+```cpp
+const __m256 a_broadcast = _mm256_set1_ps(a_val);
+
+// Process 32 floats per iteration (4 × 8-wide vectors)
+__m256 c0 = _mm256_loadu_ps(c_row + j);
+__m256 b0 = _mm256_loadu_ps(b_row + j);
+c0 = _mm256_fmadd_ps(a_broadcast, b0, c0);
+_mm256_storeu_ps(c_row + j, c0);
+// ... repeat for c1/b1, c2/b2, c3/b3 at j+8, j+16, j+24
+```
+
+Each `_mm256_fmadd_ps` does 8 multiply-adds simultaneously. Processing 4 vectors per iteration gives 32 FLOPs per loop step, and keeps the execution ports fed while loads are in flight.
+
+The implementation gracefully degrades: 16-element and 8-element cleanup loops handle the tail when the column count is not a multiple of 32, and a final scalar loop catches the last few elements.
+
+At 1024×1024, SIMD reaches approximately 11.23 GFLOPS — roughly 8.8× over naive.
+
+### Level 3: OpenMP parallelism
+
+Threading adds a different dimension. Instead of making one core faster, you use multiple cores to process independent tiles concurrently:
+
+```cpp
+#pragma omp parallel for schedule(dynamic)
+for (size_t i_tile = 0; i_tile < M; i_tile += TILE_SIZE) {
+    // Each thread processes its own row tile
+    // No synchronization needed: tiles write to disjoint rows of C
+}
+```
+
+The `dynamic` schedule balances work across threads when tile counts are uneven. Because each tile writes to a disjoint region of `C`, there are no data races and no locks.
+
+The trade-off is overhead. Thread creation, scheduling, and cache coherence traffic have a fixed cost. For small matrices, this cost can exceed the parallelism benefit. In my benchmarks, pure SIMD sometimes beats 8-thread OpenMP at 2048×2048 on macOS because of this overhead.
+
+### Level 4: combined (AVX2 + OpenMP + K-unrolling)
+
+The final implementation combines everything. OpenMP parallelism over column blocks, AVX2 intrinsics in the inner kernel, and an additional optimization: 4-way K-unrolling.
+
+Instead of broadcasting one `A` value per inner iteration, the kernel broadcasts four consecutive `A(i, k)` through `A(i, k+3)` and applies all four FMAs to the same `C` accumulator:
+
+```cpp
+const __m256 a0 = _mm256_set1_ps(A(i, k));
+const __m256 a1 = _mm256_set1_ps(A(i, k + 1));
+const __m256 a2 = _mm256_set1_ps(A(i, k + 2));
+const __m256 a3 = _mm256_set1_ps(A(i, k + 3));
+
+__m256 c0 = _mm256_loadu_ps(c_row + j);
+c0 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b0 + j), c0);
+c0 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(b1 + j), c0);
+c0 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(b2 + j), c0);
+c0 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(b3 + j), c0);
+_mm256_storeu_ps(c_row + j, c0);
+```
+
+K-unrolling amortizes the cost of loading and storing the `C` accumulator: you load `C` once, apply four rounds of FMA, and store once. Without unrolling, each K iteration would load and store `C` separately. This also improves instruction-level parallelism — the four FMA instructions are independent on the `a` and `b` operands, which lets the CPU pipeline them.
+
+The implementation gracefully degrades at compile time: if only AVX2 is available, it falls back to the SIMD path; if only OpenMP, it falls back to the parallel path; if neither, it uses blocking.
+
+## A tiny worked example: 3×3 matmul
+
+To see the access pattern difference concretely, consider \(C = A \times B\) where both are 3×3 and stored row-major:
+
+```text
+A (row-major in memory):               B (row-major in memory):
+[ a00 a01 a02 | a10 a11 a12 | ... ]    [ b00 b01 b02 | b10 b11 b12 | ... ]
+```
+
+Computing `C(0,0)` in naive `ijk` order requires:
+
+```text
+C(0,0) = A(0,0)·B(0,0) + A(0,1)·B(1,0) + A(0,2)·B(2,0)
+         ───────────────   ───────────────   ───────────────
+         A: stride 1        A: stride 1       A: stride 1
+         B: position 0      B: position 3     B: position 6   ← stride N!
+```
+
+`A` reads are sequential (good). `B` reads jump by \(N\) positions each step (bad). As \(N\) grows, those jumps exceed cache line boundaries and you get a miss on every access.
+
+With `ikj` ordering (what blocking uses), the inner loop walks `B` and `C` along rows:
+
+```text
+Fix i=0, k=0: a_val = A(0,0)
+  C(0,0) += a_val · B(0,0)    ← B: position 0
+  C(0,1) += a_val · B(0,1)    ← B: position 1   (sequential!)
+  C(0,2) += a_val · B(0,2)    ← B: position 2   (sequential!)
+```
+
+Same arithmetic, radically different memory access pattern.
+
+## Connecting GEMM to the neural network
+
+The project includes a small neural network that learns XOR to make the connection tangible:
+
+```text
+Input (4×2) → Dense(2→4) → Sigmoid → Dense(4→1) → Sigmoid → Output (4×1)
+```
+
+Each `DenseLayer::forward` call does exactly one GEMM:
+
+```cpp
+Matrix DenseLayer::forward(const Matrix& input) {
+    input_cache_ = input;
+    Matrix weights_T = weights_.transpose();
+    Matrix output(input.rows(), weights_.rows());
+    matmul_impl_(input, weights_T, output);
+    // ... add bias ...
+    return output;
+}
+```
+
+And `backward` does two more:
+
+```cpp
+Matrix DenseLayer::backward(const Matrix& grad_output) {
+    // grad_W = grad_output^T × input
+    Matrix grad_output_T = grad_output.transpose();
+    matmul_impl_(grad_output_T, input_cache_, grad_weights_);
+
+    // grad_input = grad_output × weights
+    Matrix grad_input(grad_output.rows(), weights_.cols());
+    matmul_impl_(grad_output, weights_, grad_input);
+
+    return grad_input;
+}
+```
+
+The `matmul_impl_` function pointer is what makes this work. You can train the same network with `matmul::naive` and then with `matmul::optimized`, and the only thing that changes is how fast the matrix multiplies run. The gradients, the loss, the learning — all identical.
+
+For the tiny XOR network, training times are roughly the same across all implementations (~5 ms for 5000 epochs). The matrices are too small for optimization to matter. The lesson there is real too: GEMM optimization pays off at scale. A 4×2 input matrix does not saturate a cache line, let alone a SIMD register. But scale those matrices to the thousands or millions of parameters in a real model, and the difference between naive and optimized is the difference between waiting seconds and waiting minutes.
+
+## Performance results
+
+Representative results (machine-dependent; measured on macOS with `-O3 -march=native -ffast-math`):
+
+| Size | Naive | Blocked | SIMD | Optimized (8T) |
+| ---- | ----- | ------- | ---- | --------------- |
+| 1024 | 1688 ms / 1.27 GFLOPS | — | 191 ms / 11.23 GFLOPS | — |
+| 2048 | ~33 s / 0.52 GFLOPS | — | 1671 ms / 10.28 GFLOPS | 2330 ms / 7.37 GFLOPS |
+
+SIMD delivers 8–20× speedups depending on matrix size. The pattern is consistent: the larger the matrix, the bigger the gap, because cache misses compound.
+
+An interesting result: for 2048×2048, pure SIMD (single-threaded) can beat 8-thread OpenMP. Thread overhead, cache coherence traffic, and the macOS thread scheduler conspire against parallelism at this scale. OpenMP starts winning convincingly only at very large matrices or when combined with SIMD in the optimized path.
+
+## Trade-offs: there is no free lunch
+
+Each optimization introduces complexity and platform dependencies:
+
+| Optimization | Gain | Cost |
+| ------------ | ---- | ---- |
+| Blocking | 2–3× from cache locality | Tile size tuning is hardware-specific |
+| SIMD | 8–20× from data parallelism | Platform-locked to AVX2; fallback paths needed |
+| OpenMP | Linear scaling (in theory) | Thread overhead; diminishing returns on small problems |
+| K-unrolling | ~1.5× from ILP | Code complexity; harder to maintain |
+
+The project handles platform variability through compile-time guards (`#ifdef __AVX2__`, `#ifdef _OPENMP`) and automatic fallbacks. If you build on a machine without AVX2, the SIMD path compiles to the blocked implementation. This is how production BLAS libraries work too — multiple code paths selected at build or runtime.
+
+The gap to production libraries (Eigen, MKL, OpenBLAS) remains large. Those systems add register tiling, prefetch instructions, assembly-tuned microkernels, and runtime CPU dispatch. But the core ideas — blocking for cache, SIMD for throughput, threading for parallelism — are the same ones explored here.
+
+## What I learned
+
+Three things stood out.
+
+First, memory access patterns matter more than raw instruction count. The naive and blocked implementations do the same number of multiplications and additions. The only difference is which order they touch memory. That reordering alone gives a 2–3× speedup before you write a single intrinsic.
+
+Second, SIMD is where the big wins live for single-threaded code. Going from scalar to AVX2 is not just "8× because 8 lanes" — the FMA instruction also folds a multiply and an add into one operation, and the wider loads amortize memory access overhead. Real-world speedups of 8–20× are typical.
+
+Third, the neural network connection makes the optimization tangible. When you see that `forward` is literally calling your GEMM function, the motivation for fast matrix multiply stops being abstract. Every millisecond you shave off GEMM directly reduces training time, linearly.
+
+## References
+
+Goto, K., & Van De Geijn, R. A. (2008). [Anatomy of high-performance matrix multiplication](https://dl.acm.org/doi/10.1145/1356052.1356053). *ACM Transactions on Mathematical Software, 34*(3).
+
+Intel Corporation. (n.d.). [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html). Retrieved April 6, 2026.
+
+Jia, Z., Maggioni, M., Staiger, B., & Scarpazza, D. P. (2018). [Dissecting the NVIDIA Volta GPU architecture via microbenchmarking](https://arxiv.org/abs/1802.06991). *arXiv preprint*.
+
+Lam, M. S., Rothberg, E. E., & Wolf, M. E. (1991). [The cache performance and optimizations of blocked algorithms](https://dl.acm.org/doi/10.1145/106972.106981). *ASPLOS*.
+
+Martin, M. (2026). [matrix-multiplication](https://github.com/manumartinm/matrix-multiplication) [Source code]. GitHub.
