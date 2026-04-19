@@ -1,0 +1,298 @@
+---
+title: "Building a Go CLI to Compare Diff Algorithms"
+publishedAt: "2026-04-19"
+summary: "A practical case study in building a Go CLI that compares LCS, Myers, Patience, and Histogram diff algorithms, with unified output, benchmarks, and the trade-offs that actually matter."
+---
+
+I like building small tools when a topic feels easy to hand-wave but hard to explain precisely.
+
+That was the motivation for this project: build a Go CLI that runs several line-based diff algorithms over the same input, renders their output in a GitHub-style unified format, and reports enough metrics to make the trade-offs visible. Not a replacement for Git, and not a library trying to be perfect. The point was to make the algorithms concrete.
+
+The full implementation is on GitHub: [manumartinm/go-diff-lab](https://github.com/manumartinm/go-diff-lab).
+
+The interesting part is not just “which one is faster.” It is how the mental model changes depending on the algorithm: dynamic programming for LCS, shortest-path intuition for Myers, and anchor-based heuristics for Patience and Histogram. Once I had all of them behind one interface, the differences became much easier to see.
+
+## Why build this instead of just reading about diff
+
+Diff algorithms are one of those topics that look straightforward from the outside. You compare two texts, mark what changed, and move on.
+
+But the moment you try to implement more than one algorithm, you run into the real questions. What exactly is a “good” diff? Is it the shortest edit script? The most readable patch? The one that uses the least memory? The one that behaves best on source code with repeated blocks?
+
+That is why I wanted a tool with one shared pipeline and multiple interchangeable algorithms. If every algorithm consumes the same normalized input and emits the same edit operations, then the comparison becomes much cleaner.
+
+## Architecture: one pipeline, several algorithms
+
+The CLI has a simple flow:
+
+```text
+old file + new file
+        |
+        v
+line normalization
+        |
+        v
+algorithm registry
+  |      |       |        |
+  v      v       v        v
+ LCS   Myers  Patience  Histogram
+        |
+        v
+unified edit script
+        |
+        +--> stats output
+        +--> unified diff output
+        +--> JSON output
+        +--> benchmark output
+```
+
+The key design decision was to keep a shared output model. Every algorithm returns a sequence of edit operations:
+
+- `Equal`: the line exists in both versions
+- `Delete`: the line is present only in the old version
+- `Insert`: the line is present only in the new version
+
+That sounds obvious, but it matters a lot. Once the algorithms all emit the same shape, the reporting layer no longer cares how the diff was produced. It can render a unified patch, aggregate counts, or emit JSON without knowing whether the path came from dynamic programming or from anchor heuristics.
+
+## The core representation
+
+This project is deliberately **line-based**. That means the input text is split by `\n`, and each line becomes a token.
+
+This has two consequences. First, the implementation stays readable. Second, the output looks familiar, because Git-style unified diffs are usually line-oriented too ([Git project, n.d.-a](https://git-scm.com/docs/git-diff)).
+
+The downside is that line-based diff ignores finer structure inside a line. If one 200-character line changes in one position, the tool treats the whole line as replaced. That is a reasonable compromise for a learning project and for source-code diffs, but it would not be enough for a rich text editor or a word processor.
+
+## A tiny worked example
+
+I used this tiny dataset throughout the project because it is small enough to inspect manually:
+
+```text
+old:
+alpha
+beta
+gamma
+delta
+
+new:
+alpha
+beta
+gamma-prime
+delta
+epsilon
+```
+
+The unified diff output looks like this:
+
+```text
+--- small_old.txt
++++ small_new.txt
+@@ -1,4 +1,5 @@
+ alpha
+ beta
+-gamma
++gamma-prime
+ delta
++epsilon
+```
+
+That diff is intuitive, but different algorithms reach it differently.
+
+- LCS reasons in terms of the **longest common subsequence**, meaning the largest in-order set of lines shared by both versions.
+- Myers reasons in terms of the **shortest edit script**, which is equivalent to the shortest path in an edit graph ([Myers, 1986](https://neil.fraser.name/writing/diff/myers.pdf)).
+- Patience tries to find stable anchor lines that appear uniquely in both files, which often makes code diffs easier to read ([Git project, n.d.-b](https://git-scm.com/docs/diff-algorithm-option.html)).
+- Histogram extends the anchor idea by preferring low-frequency common lines even when uniqueness is not available ([Git project, n.d.-b](https://git-scm.com/docs/diff-algorithm-option.html)).
+
+For this tiny example, they all produce the same visible patch. That is useful, because it shows a general truth about diff tooling: many inputs do not distinguish the algorithms at all. The interesting cases are the messy ones.
+
+## How the algorithms differ
+
+### LCS: the clean dynamic-programming baseline
+
+LCS was the obvious starting point because it is easy to explain and easy to validate.
+
+You build a table where cell \((i, j)\) stores the length of the longest common subsequence between the first \(i\) lines of the old file and the first \(j\) lines of the new file. Then you backtrack through the table to recover the edit script.
+
+Its main advantage is clarity. The cost is memory: in this implementation, a full \(n \times m\) table is materialized, where \(n\) and \(m\) are the number of lines in the two inputs.
+
+The pseudocode looks like this:
+
+```text
+for i in 1..n:
+  for j in 1..m:
+    if old[i-1] == new[j-1]:
+      dp[i][j] = dp[i-1][j-1] + 1
+    else:
+      dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+
+backtrack from (n, m):
+  if lines match, emit Equal
+  else move toward the larger neighbor:
+    left  -> Insert
+    up    -> Delete
+```
+
+### Myers: shortest edit script through the edit graph
+
+Myers is the most elegant algorithm in the set.
+
+The insight is that you can model diff as a pathfinding problem on a grid. A point \((x, y)\) means “I have consumed the first \(x\) lines of the old input and the first \(y\) lines of the new input.” Horizontal and vertical moves correspond to deletions and insertions. Diagonal moves correspond to equal lines.
+
+The algorithm explores the grid by **edit distance layers** \(D\), not by filling the whole matrix. That makes it very attractive when the two files are similar and the minimum edit script is short ([Myers, 1986](https://neil.fraser.name/writing/diff/myers.pdf)).
+
+The pseudocode is roughly:
+
+```text
+V[1] = 0
+for D in 0..N:
+  for k in {-D, -D+2, ..., D}:
+    choose whether we came from k-1 or k+1
+    x = furthest reachable x on diagonal k
+    y = x - k
+    while x < n and y < m and old[x] == new[y]:
+      x++, y++   # follow diagonal "snake"
+    store furthest x for this diagonal
+    if x >= n and y >= m:
+      reconstruct path from saved trace
+```
+
+That “furthest-reaching \(x\) on each diagonal” idea is the whole trick. The algorithm does not care about every point in the grid. It only keeps the best frontier for each diagonal at each edit distance.
+
+### Patience: readability through anchors
+
+Patience diff is less obsessed with formal optimality and more interested in producing stable patches.
+
+It first finds lines that are unique in both files, uses them as anchors, keeps only the non-crossing anchor set, and then fills the gaps with another diff algorithm. In my project, the gap-filler is LCS.
+
+This approach is often helpful on source code because it avoids some of the strange alignments that a minimal edit script can produce. A minimal patch is not always the patch a human would prefer to read.
+
+The pseudocode is:
+
+```text
+count line frequencies in old and new
+anchors = lines that appear exactly once in both
+sort anchors by old index
+keep a longest increasing subsequence on new indices
+
+for each gap between consecutive anchors:
+  diff that gap with LCS
+
+emit anchors as Equal operations
+```
+
+Patience is really an anchor selection strategy plus a fallback diff in the unresolved regions.
+
+### Histogram: a more flexible anchor heuristic
+
+Histogram is close in spirit to Patience, but it relaxes the anchor rule.
+
+Instead of insisting on strictly unique common lines, it prefers lines with low frequency. That gives it more freedom on inputs where no strong unique anchors exist. In practice, it often behaves like a middle ground between Patience’s readability bias and a more general-purpose diff heuristic ([Git project, n.d.-b](https://git-scm.com/docs/diff-algorithm-option.html)).
+
+The simplified pseudocode in this project is:
+
+```text
+count frequencies of each line in old and new
+find matching lines with the lowest combined frequency
+sort candidate matches by old index
+keep a longest increasing subsequence on new indices
+
+for each gap between anchors:
+  diff that gap with LCS
+```
+
+In other words, it behaves like Patience with a looser definition of what makes a good anchor.
+
+## A short math section
+
+For this project, the most useful formulas are the complexity bounds:
+
+\[
+\text{LCS time} = O(nm), \qquad \text{LCS space} = O(nm)
+\]
+
+Here, \(n\) is the number of lines in the old input and \(m\) is the number of lines in the new input.
+
+\[
+\text{Myers time} = O(ND)
+\]
+
+Here, \(N = n + m\), and \(D\) is the length of the minimum edit script, meaning the minimum number of insertions plus deletions needed to transform one input into the other ([Myers, 1986](https://neil.fraser.name/writing/diff/myers.pdf)).
+
+That formula is why Myers is so appealing. If two large files differ only slightly, then \(D\) stays small and the algorithm avoids paying the full \(O(nm)\) cost.
+
+Patience and Histogram are harder to summarize with one neat bound in this project because they are hybrids: they spend work finding anchors and then delegate unresolved regions to LCS. Their performance depends heavily on how much structure the input offers.
+
+## Benchmark results
+
+One lesson from building the CLI is that benchmark numbers are easy to over-interpret.
+
+So I measured the project two different ways:
+
+- the Go benchmark suite (`go test -bench=. -benchmem ./internal/bench`)
+- the CLI benchmark command on the tiny hand-checkable dataset
+
+The benchmark suite currently uses the repo's `medium_old.txt` and `medium_new.txt` fixtures. Those files are still small, so these numbers are best interpreted as **implementation overhead on a tiny source-code-shaped input**, not as universal rankings.
+
+### Go benchmark suite (`medium_*` dataset)
+
+Measured inside `golang:1.22` on Linux arm64:
+
+| Algorithm | ns/op | B/op | allocs/op |
+| --------- | ----: | ---: | --------: |
+| LCS       |  1403 | 2752 |        15 |
+| Myers     |  1807 | 4744 |        19 |
+| Patience  |  2778 | 3312 |        30 |
+| Histogram |  2914 | 3464 |        33 |
+
+On this tiny benchmark, LCS wins on raw time. That might look surprising if you have seen Myers described as the more efficient algorithm. The reason is simple: the dataset is so small that constant factors dominate. The full \(O(nm)\) table is tiny here, so the bookkeeping overhead of Myers outweighs its asymptotic advantage.
+
+### CLI benchmark command (`small_*` dataset)
+
+The CLI's own `bench` command reports a single-run snapshot with approximate allocation deltas:
+
+| Algorithm | time_ns | bytes_alloc | ops | edits |
+| --------- | ------: | ----------: | --: | ----: |
+| LCS       |    5250 |        1216 |   6 |     3 |
+| Myers     |    2958 |        1816 |   6 |     3 |
+| Patience  |   26500 |        1328 |   6 |     3 |
+| Histogram |    6500 |        1480 |   6 |     3 |
+
+The broader lesson is that benchmark rankings depend heavily on input shape:
+
+- similar files with small edit distance often favor Myers
+- tiny files can favor LCS because the table is cheap
+- anchor-based methods pay extra setup cost, but they can produce nicer patches on messy source-code inputs
+
+That is why I found it more useful to interpret benchmarks alongside the output itself. If an algorithm is a bit slower but produces a patch that is easier to understand, that can be the better engineering choice. A diff is ultimately read by humans or consumed by another tool, not admired in isolation.
+
+## The output formats turned out to matter as much as the algorithms
+
+I started this project thinking mainly about algorithm internals. The reporting layer ended up being almost as important.
+
+The CLI now supports three main ways to look at a diff:
+
+- a stats view for quick comparisons
+- a unified text view that looks like GitHub
+- a JSON view for automation
+
+That split is valuable because each audience wants something different. When I am debugging the algorithm, I want to see the actual patch. When I am comparing performance, I want counts and timings. When I am feeding another program, I want structured output.
+
+The shared edit-script representation made all of that much easier than I expected.
+
+## Conclusions and next steps
+
+The main conclusion from the project is that there is no universally “best” diff algorithm. LCS is simple and easy to reason about, but its dense table becomes expensive as inputs grow. Myers is elegant and often more efficient when files are similar, but it is also much easier to implement incorrectly. Patience and Histogram trade some formal minimality for patches that are often easier for humans to read, especially on source code.
+
+That trade-off matters because a diff is not just an algorithmic object. It is also a user interface. If the main consumer is a code-review tool, readability may matter more than the shortest possible edit script. If the consumer is another system that only cares about edit distance, minimality may matter more. And if the workload gets closer to real editor behavior, a purely line-based representation stops being enough.
+
+That is why the strongest production lesson here is not “use algorithm X.” It is that the algorithm is only one part of the system. Input normalization, output format, benchmark methodology, and the shape of the real workload matter just as much.
+
+If I kept pushing this project, I would focus on three extensions. First, I would add token-level or character-level refinement inside changed lines so replacements are more precise. Second, I would separate benchmark mode from human-facing patch mode more aggressively, because the best internal representation for measurement is not necessarily the best one for readability. Third, I would add more adversarial datasets: repeated blocks, reordered functions, and larger generated files.
+
+At that point, the tool would stop being mainly a teaching project and start becoming a more serious diff workbench.
+
+## References
+
+Git project. (n.d.-a). _git-diff Documentation_. [https://git-scm.com/docs/git-diff](https://git-scm.com/docs/git-diff)
+
+Git project. (n.d.-b). _diff-algorithm-option Documentation_. [https://git-scm.com/docs/diff-algorithm-option.html](https://git-scm.com/docs/diff-algorithm-option.html)
+
+Myers, E. W. (1986). _An O(ND) difference algorithm and its variations_. _Algorithmica, 1_, 251-266. [https://neil.fraser.name/writing/diff/myers.pdf](https://neil.fraser.name/writing/diff/myers.pdf)
