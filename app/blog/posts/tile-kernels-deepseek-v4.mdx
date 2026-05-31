@@ -1,0 +1,210 @@
+---
+title: "TileKernels in the DeepSeek-V4 Era"
+publishedAt: "2026-05-31"
+summary: "How TileKernels maps low-level GPU kernels to DeepSeek-V4 ideas like compressed long-context attention and manifold-constrained residual routing, with a small worked example and a practical test-reading workflow."
+---
+
+When people discuss long-context LLM progress, the conversation usually centers on model architecture. That matters, but deployment reality is often decided one layer lower: kernel efficiency, memory movement, and how much orchestration overhead we pay per token.
+
+This is where TileKernels becomes interesting. The project provides optimized GPU kernels in Python via TileLang, covering Mixture of Experts (MoE) routing, quantization, transpose, and the mHC pipeline used in DeepSeek-style model stacks ([Wang et al., 2026](https://github.com/deepseek-ai/TileKernels)).
+
+DeepSeek-V4 puts long-context efficiency at the center of the design with compressed attention variants and manifold-constrained hyper-connections (mHC), so it is a useful lens for understanding why a kernel library like TileKernels is strategically important in modern inference and training systems ([k-a.in, 2026](https://www.k-a.in/DeepSeek-V4.html)).
+
+## Why this matters now
+
+Reasoning-heavy models scale quality by spending more compute at test time. The challenge is that long contexts make attention and Key-Value cache (KV-cache) management increasingly expensive, so architecture-level gains need kernel-level support to stay practical.
+
+To handle this long-context pressure, DeepSeek-V4 introduces Compressed Sparse Attention (CSA). The core architecture of CSA compresses the KV cache of each \(m\) tokens into a single entry to drastically reduce memory usage.
+
+First, the model computes two series of Key-Value entries \(C_a\) and \(C_b\) from the hidden states \(H\), along with their corresponding compression weights \(Z_a\) and \(Z_b\):
+
+\[
+C_a = H \cdot W_a^{KV}, \quad C_b = H \cdot W_b^{KV}
+\]
+\[
+Z_a = H \cdot W_a^Z, \quad Z_b = H \cdot W_b^Z
+\]
+
+Each group of \(m\) tokens is then compressed into one entry based on their compression weights and learnable positional biases (\(B_a, B_b\)). A Softmax function normalizes the scores:
+
+\[
+[S^a_{mi:m(i+1)-1};\ S^b_{m(i-1):mi-1}] = \text{Softmax}_{\text{row}}([Z^a_{mi:m(i+1)-1} + B*a;\ Z^b*{m(i-1):mi-1} + B_b])
+\]
+
+Finally, the compressed KV entry \(C_i^{\text{Comp}}\) is formed by summing the weighted elements:
+
+\[
+C*i^{\text{Comp}} = \sum*{j=mi}^{m(i+1)-1} S*j^a \odot C_j^a + \sum*{j=m(i-1)}^{mi-1} S_j^b \odot C_j^b
+\]
+
+Although each compressed entry derives from \(2m\) tokens, the overlapping windows mean that the effective sequence length is compressed to \(\frac{1}{m}\). This significantly reduces the memory footprint, but introduces new kernel-level challenges like overlapped data reads and fused weight aggregation.
+
+DeepSeek-V4's public write-up describes this clearly: compressed sparse attention, heavily compressed attention, and mHC all reduce one bottleneck while introducing new low-level constraints on memory layout, scheduling, and numerical stability ([k-a.in, 2026](https://www.k-a.in/DeepSeek-V4.html)).
+
+TileKernels is not a full model framework; it is the performance substrate that can implement these patterns with less Python overhead and tighter GPU utilization ([Wang et al., 2026](https://github.com/deepseek-ai/TileKernels)).
+
+## Enter TileLang: GPU kernels in Python
+
+To understand TileKernels, you first have to understand the language it is written in: **TileLang**.
+
+TileLang is a Domain-Specific Language (DSL) embedded in Python, designed to write high-performance GPU kernels. Normally, to squeeze maximum performance out of an NVIDIA GPU, engineers write CUDA C/C++, manually managing pointers, thread synchronization, and SRAM (shared memory).
+
+TileLang allows developers to write that same low-level logic directly in Python. It provides primitives to control thread hierarchy, shared memory, and vectorization, and then compiles that Python code into ultra-optimized GPU machine code.
+
+Here is a simplified example of how TileKernels uses TileLang to transpose a batched tensor:
+
+```python
+import tilelang
+from tilelang import language as T
+
+@tilelang.jit
+def get_batched_transpose_kernel(shape_x, shape_y, dtype):
+    num_threads = 256
+    block_x, block_y = 64, 64
+
+    @T.prim_func
+    def batched_transpose_kernel(
+        x: T.StridedTensor[(T.dynamic('B'), shape_x, shape_y), dtype],
+        out: T.Tensor[(T.dynamic('B'), shape_y, shape_x), dtype],
+    ):
+        # 1. Define the GPU block grid
+        with T.Kernel(shape_y // block_y, shape_x // block_x, T.dynamic('B'), threads=num_threads) as (pid_y, pid_x, pid_batch):
+
+            # 2. Allocate shared memory (ultra-fast GPU SRAM)
+            out_shared = T.alloc_shared((block_y, block_x), dtype)
+
+            # ... (Logic to read from global memory to out_shared goes here) ...
+
+            # 3. Thread synchronization barrier
+            T.sync_threads()
+
+            # 4. Parallel write from shared memory to the final output
+            for i, j in T.Parallel(block_y, block_x):
+                out[pid_batch, pid_y * block_y + i, pid_x * block_x + j] = out_shared[i, j]
+
+    return batched_transpose_kernel
+```
+
+DeepSeek-V4 requires highly unusual memory access patterns for its new architectures. If they tried to execute these using standard PyTorch operations, the GPU would spend more time moving data than calculating. TileLang lets them build custom kernels (TileKernels) to fuse operations and manage SRAM directly.
+
+## Bridging DeepSeek-V4 ideas to TileKernels modules
+
+DeepSeek-V4 keeps a MoE-heavy backbone, adopts compressed long-context attention patterns, and introduces manifold-constrained residual mixing through mHC ([k-a.in, 2026](https://www.k-a.in/DeepSeek-V4.html)).
+
+### What is Manifold Hyper-Connection (mHC)?
+
+In traditional Transformers, residual connections are simple additions (\(X*{l+1} = X_l + \mathcal{F}(X_l)\)) to help gradients flow. However, DeepSeek-V4 uses Hyper-Connections (HC) to expand the width of the residual stream by a factor of \(n*{\text{hc}}\) (specifically, set to 4).
+
+Instead of a simple addition, the update of the residual state incorporates three linear mappings—an input mapping \(A_l\), a residual transformation \(B_l\), and an output mapping \(C_l\):
+
+\[
+X\_{l+1} = B_l X_l + C_l \mathcal{F}\_l(A_l X_l)
+\]
+
+The core innovation of **mHC (Manifold-Constrained Hyper-Connections)** is constraining the residual mapping matrix \(B_l\) to the manifold of **doubly stochastic matrices** (also known as the Birkhoff polytope):
+
+\[
+B_l \in \mathcal{M} \coloneqq \{M \in \mathbb{R}^{n \times n} \mid M\mathbf{1}\_n = \mathbf{1}\_n,\ \mathbf{1}\_n^T M = \mathbf{1}\_n^T,\ M \geq 0\}
+\]
+
+Why does this matter? This mathematical constraint guarantees that the spectral norm of the mapping matrix \(\|B_l\|\_2\) is bounded by 1. Therefore, the transformation becomes "non-expansive" (activations do not explode or vanish as they flow through hundreds of layers). Because the set \(\mathcal{M}\) is closed under multiplication, it guarantees massive numerical stability during both the forward pass and backpropagation in deep stacks of mHC.
+
+Additionally, the input (\(A_l\)) and output (\(C_l\)) mappings are constrained to be non-negative and bounded via a Sigmoid function to prevent signal cancellation, and the parameters for these matrices are dynamically generated based on the input.
+
+## Implementing Mixture of Experts (MoE) with TileKernels
+
+DeepSeek-V4 retains a heavily optimized Mixture of Experts (MoE) backbone. In a standard dense model, every token passes through every parameter in the Feed-Forward Network (FFN) layers. MoE changes this by replacing the dense FFN with multiple smaller "expert" networks. A routing mechanism decides which tokens go to which experts, allowing the model to increase its total parameter count—and thus its capacity—without drastically increasing the compute cost per token.
+
+However, while MoE is elegant mathematically, it is notoriously hostile to GPU hardware. GPUs thrive on contiguous, predictable blocks of memory. MoE shatters this predictability. Tokens from the same sequence might be scattered across dozens of different experts, creating massive memory fragmentation and synchronization overhead.
+
+### The TileKernels MoE pipeline
+
+The execution flow typically follows three optimized steps:
+
+1. **Routing and grouped indices:** First, a routing kernel computes the expert assignments based on the router's gating decisions. It calculates the necessary grouped indices to figure out exactly where each token needs to go.
+2. **Token reordering (Gather):** Using these indices, custom transpose and gather kernels reorder the scattered tokens into contiguous mini-batches for each expert. This step ensures that when the expert actually runs, it reads from a clean, contiguous block of SRAM rather than thrashing the global memory. 
+
+To see how TileKernels handles the complex task of transposing data at a low level, here is an example of the batched transpose kernel logic used under the hood to align these chunks in memory:
+
+```python
+import tilelang
+from tilelang import language as T
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def get_batched_transpose_kernel(shape_x_mod_128, shape_y_mod_128, dtype):
+    # Dynamic dimensions calculated at runtime
+    num_batches = T.dynamic('num_batches')
+    shape_x = T.dynamic('shape_x')
+    shape_y = T.dynamic('shape_y')
+    stride_x = T.dynamic('stride_x')
+    
+    num_threads = 256
+    block_x = 128 if shape_x_mod_128 == 0 else 64
+    block_y = 128 if shape_y_mod_128 == 0 else 64
+
+    @T.prim_func
+    def batched_transpose_kernel(
+        x: T.StridedTensor[(num_batches, shape_x, shape_y), (shape_x * stride_x, stride_x, 1), dtype],
+        out: T.Tensor[(num_batches, shape_y, shape_x), dtype],
+    ):
+        with T.Kernel(shape_y // block_y, shape_x // block_x, num_batches, threads=num_threads) as (pid_y, pid_x, pid_batch):
+            # Shared memory allocation with padding to reduce bank conflicts
+            out_shared = T.alloc_shared((block_y, block_x + 4), dtype)
+            
+            # ... (Unrolled loops read from global memory to registers, then write to out_shared) ...
+            
+            T.sync_threads()
+            
+            # Write out to final transposed tensor in parallel
+            for i, j in T.Parallel(block_y, block_x, loop_layout=loop_layout):
+                out[pid_batch, pid_y * block_y + i, pid_x * block_x + j] = out_shared[i, j]
+
+    return batched_transpose_kernel
+```
+
+3. **Expert compute and scatter:** The expert-local computation executes on the newly organized data. Once finished, another custom kernel reduces the outputs and scatters them back to their original token order in the sequence.
+
+### How routing works: a tiny worked example
+
+Before tokens can be reordered, the model must decide where they go. This is handled by a **router**, which is typically a small neural network layer that scores each token against all available experts. The router computes an affinity score, and then a selection mechanism (usually a top-\(k\) operation) assigns the tokens to their most relevant experts. Interestingly, DeepSeek-V4 also introduces a Hash routing strategy for its initial layers, where the target expert is determined by a predefined hash function based on the token ID rather than a learned router.
+
+To visualize how this translates to memory movement, assume a sequence of 4 tokens and 2 experts, using top-1 routing:
+
+```text
+Tokens:   t0  t1  t2  t3
+Experts:  e0  e1
+Routing:  t0->e0, t1->e1, t2->e1, t3->e0
+```
+
+If we executed this naively after the routing decision, the GPU would jump back and forth in memory: `e0` processes `t0`, then `e1` processes `t1` and `t2`, then back to `e0` for `t3`.
+
+TileKernels intercepts this. Its token reordering kernels group the memory first:
+
+- `e0` receives a contiguous block containing `[t0, t3]`.
+- `e1` receives a contiguous block containing `[t1, t2]`.
+
+Both experts run in parallel on optimized blocks of data, and the final scatter kernel places the results back into the `[t0, t1, t2, t3]` layout. 
+
+### Why TileLang makes this possible
+
+Writing these specialized gather/scatter and transpose kernels is complex because they are deeply tied to how data moves between the GPU's global memory (HBM) and shared memory (SRAM).
+
+TileLang allows researchers to build these kernels via its Just-In-Time (JIT) compilation pipeline. When a kernel is defined using `@tilelang.jit`, TileLang parses the Python syntax into an Abstract Syntax Tree (AST). It then handles the hardware-specific lowering, mapping loops to thread blocks, and performs memory planning to orchestrate the movement of data into SRAM. Finally, an autotuning phase discovers the optimal thread configurations for the specific GPU architecture.
+
+By abstracting away the CUDA C++ boilerplate while preserving fine-grained control over SRAM and thread synchronization, TileLang makes it possible to rapidly prototype and deploy these critical MoE orchestration routines.
+
+## Conclusions
+
+DeepSeek-V4-style architecture points toward an obvious systems conclusion: long-context progress is inseparable from kernel quality. The model can be elegant on paper, but production behavior depends on routing locality, cache compression, and residual-mixing stability at the kernel level.
+
+TileKernels is valuable precisely because it sits at this boundary. It gives you a place to encode model-specific execution patterns as explicit, optimizable GPU kernels rather than hidden framework overhead.
+
+If you are evaluating long-context architectures, reading the model report is only half the work. The other half is understanding the kernel substrate that makes those ideas affordable.
+
+## References
+
+k-a.in. (2026). _DeepSeek V4_. [https://www.k-a.in/DeepSeek-V4.html](https://www.k-a.in/DeepSeek-V4.html)
+
+Wang, X., Xu, C., Cao, H., Tian, R., Zhao, W., Yu, K., & Zhao, C. (2026). _TileKernels_ [Software]. GitHub. [https://github.com/deepseek-ai/TileKernels](https://github.com/deepseek-ai/TileKernels)
+
+Tile AI. (n.d.). _TileLang_. GitHub. [https://github.com/tile-ai/tilelang](https://github.com/tile-ai/tilelang)
