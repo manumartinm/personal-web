@@ -1,0 +1,143 @@
+---
+title: "Boltzmann Generators: Sampling Equilibrium States with Deep Learning"
+publishedAt: "2026-06-14"
+summary: "A technical deep dive into Boltzmann Generators, exploring how Normalizing Flows can directly sample equilibrium states of many-body systems, complete with a from-scratch PyTorch implementation of RealNVP and Flow Matching on 2D potentials."
+---
+
+Molecular Dynamics (MD) simulations are the workhorse of computational chemistry and biophysics, allowing us to study the movements and interactions of atoms over time. However, they suffer from a fundamental flaw: the **rare event sampling problem**.
+
+Many interesting biological processes—like protein folding or ligand binding—involve transitioning between metastable states that are separated by high energy barriers. Because MD simulates Newtonian mechanics step-by-step, the system spends the vast majority of its time vibrating within a single local energy minimum. Crossing the barrier to discover a new state is a "rare event" that might take milliseconds or seconds of simulated time, which translates to weeks or months of compute time.
+
+In 2019, Noé et al. proposed a radical alternative: **[Boltzmann Generators](https://science.sciencemorg/content/365/6457/eaaw1147)**. Instead of simulating the _dynamics_ to eventually reach equilibrium, what if we could train a generative neural network to sample from the equilibrium distribution _directly_?
+
+Over the past few weeks, I've been studying this paper and building a from-scratch implementation in PyTorch to understand the mechanics. In this post, we'll dive into the math behind Boltzmann Generators, look at a custom RealNVP implementation, and see how it performs on classic 2D potentials like the Double-Well and Müller-Brown. Also, this have a lot of relationship with the final thesis of my bachelor on peptide design.
+
+## The Math: Normalizing Flows and Statistical Mechanics
+
+To understand how Boltzmann Generators work, we first need to understand **Normalizing Flows**. 
+
+Imagine you have a perfectly round ball of clay (a simple, easy-to-sample probability distribution, like a standard Gaussian bell curve). A Normalizing Flow is a neural network that learns a sequence of instructions to stretch, squish, and mold that clay into a highly complex shape (our target distribution, like the multiple energy wells of a molecule). 
+
+Crucially, it does this without ever tearing or folding the clay over itself. Because the transformation is strictly invertible and smooth, we can always trace any point on the complex shape back to its exact origin on the simple ball. Even better, we can calculate exactly how much the "clay" was stretched or compressed at any given point (this is known as tracking the volume change).
+
+Mathematically, let $\mathbf{z} \sim \mu_Z(\mathbf{z})$ be our simple prior (the ball of clay). We want to learn an invertible, differentiable transformation $F_{\theta}$ such that the output $\mathbf{x} = F_{\theta}(\mathbf{z})$ follows the target Boltzmann distribution:
+
+$$ \mu_X(\mathbf{x}) = \frac{1}{Z} e^{-u(\mathbf{x})} $$
+
+where $u(\mathbf{x})$ is the dimensionless potential energy (energy divided by $k_B T$) and $Z = \int e^{-u(\mathbf{x})} d\mathbf{x}$ is the intractable partition function.
+
+Because $F_{\theta}$ is a bijective Normalizing Flow, we can exactly compute the probability of any generated sample $\mathbf{x}$ using the change of variables formula:
+
+$$ p*{\theta}(\mathbf{x}) = \mu_Z(\mathbf{z}) \left| \det \mathbf{J}*{F\_{\theta}}(\mathbf{z}) \right|^{-1} $$
+
+where $\mathbf{J}_{F_{\theta}}$ is the Jacobian of the transformation.
+
+### Training by Energy (KL Divergence)
+
+How do we train this network? If we already have some MD data, we can use standard Maximum Likelihood (ML) training, minimizing the negative log-likelihood of the data under our model. This is equivalent to minimizing the forward KL divergence $D_{KL}(\mu_X \| p_{\theta})$.
+
+But the magic of Boltzmann Generators is that we can also train them _without_ data, using only the energy function $u(\mathbf{x})$. We do this by minimizing the reverse KL divergence $D_{KL}(p_{\theta} \| \mu_X)$:
+
+$$ J*{KL} = \mathbb{E}*{\mathbf{z} \sim \mu*Z} \left[ u(F*{\theta}(\mathbf{z})) - \log \mu*Z(\mathbf{z}) - \log \left| \det \mathbf{J}*{F\_{\theta}}(\mathbf{z}) \right| \right] $$
+
+This loss function is entirely self-contained. We sample $\mathbf{z}$ from the prior, push it through the network to get $\mathbf{x}$, compute the physical energy $u(\mathbf{x})$, and penalize high energies while rewarding high entropy (the log determinant term).
+
+### Statistical Reweighting
+
+Even a well-trained Normalizing Flow won't perfectly match the true Boltzmann distribution. To get exact equilibrium statistics, we use **Importance Sampling**. Because we can exactly evaluate both the generated probability $p_{\theta}(\mathbf{x})$ and the unnormalized true probability $e^{-u(\mathbf{x})}$, we can assign a statistical weight to each generated sample:
+
+$$ w(\mathbf{x}) = \frac{e^{-u(\mathbf{x})}}{p\_{\theta}(\mathbf{x})} $$
+
+We can then compute exact ensemble averages of any observable $O(\mathbf{x})$ using these weights, and assess the quality of our generator using the Effective Sample Size (ESS).
+
+## Implementation: Building RealNVP in PyTorch
+
+To make this concrete, I implemented **RealNVP** (Real-valued Non-Volume Preserving transformations), one of the foundational Normalizing Flow architectures used in the original paper.
+
+The core building block of RealNVP is the **Affine Coupling Layer**. It splits the input vector into two halves using a binary mask. The first half (where `mask=1`) passes through unchanged. The second half (where `mask=0`) undergoes an affine transformation (scale and shift), where the scale and shift parameters are computed by a neural network that only looks at the _first_ half.
+
+Here is the core logic from my implementation (`src/bg/flows/coupling.py`):
+
+```python
+class AffineCoupling(Flow):
+    # ... init omitted ...
+
+    def forward(self, z: Tensor) -> tuple[Tensor, Tensor]:
+        # The components we condition on (pass through unchanged)
+        h_cond = z * self.mask
+
+        # Neural network predicts scale and shift based ONLY on h_cond
+        log_scale, t = self._st(h_cond)
+
+        # Only apply scale/shift to the components we are transforming
+        log_scale = log_scale * (1 - self.mask)
+        t = t * (1 - self.mask)
+
+        # The affine transformation
+        x = h_cond + (1 - self.mask) * (z * torch.exp(log_scale) + t)
+
+        # The log determinant of the Jacobian is simply the sum of the log scales
+        log_det = log_scale.sum(dim=-1)
+
+        return x, log_det
+```
+
+Because the neural network `_st` only looks at the unchanged half, the Jacobian matrix of this transformation is triangular. This means its determinant is just the product of its diagonal entries, which is incredibly cheap to compute: just the sum of the `log_scale` vector!
+
+To build the full `RealNVP` model, we stack multiple `AffineCoupling` layers, alternating the mask (e.g., `[1, 0]`, then `[0, 1]`) so that all dimensions get transformed.
+
+```python
+class RealNVP(Flow):
+    def forward(self, z: Tensor) -> tuple[Tensor, Tensor]:
+        log_det_total = torch.zeros(z.shape[0], device=z.device)
+        h = z
+        for layer in self.layers:
+            h, log_det = layer.forward(h)
+            log_det_total = log_det_total + log_det
+        return h, log_det_total
+```
+
+## Experiments: Double-Well and Müller-Brown Potentials
+
+To test this implementation, I started with the classic 2D Double-Well potential. It has two deep minima at $x = \pm 1$, separated by a high energy barrier at $x = 0$. The $y$ direction is just a harmonic oscillator.
+
+```python
+class DoubleWell2D:
+    def __init__(self, a: float = 4.0, sigma_y: float = 0.5) -> None:
+        self.a = a
+        self.sigma_y = sigma_y
+
+    def energy(self, x: Tensor) -> Tensor:
+        xx = x[..., 0]
+        yy = x[..., 1]
+        # Minima at x=±1, barrier height defined by 'a'
+        return self.a * (xx.pow(2) - 1.0).pow(2) + 0.5 * (yy / self.sigma_y).pow(2)
+```
+
+With a barrier height of $a=4.0$ kT, a standard Markov Chain Monte Carlo (MCMC) sampler gets stuck in whichever well it starts in. It almost never crosses the barrier.
+
+However, training the `RealNVP` model purely on the $J_{KL}$ loss (using the `energy` function above) yields spectacular results. The network learns to map the single mode of the Gaussian prior into the two distinct modes of the Double-Well.
+
+After reweighting, the **Effective Sample Size (ESS) was 98%**, meaning almost every generated sample was physically valid. Furthermore, the free energy difference between the two wells, $\Delta F$, was calculated to be $+0.004$ kT. The true analytical value is exactly $0$, showing that the model accurately captured the relative populations of the two metastable states without ever simulating a transition between them.
+
+Scaling up the complexity slightly, I tested the model on the **Müller-Brown potential**, a standard benchmark in computational chemistry featuring three distinct minima arranged in a non-linear path. The Boltzmann Generator successfully found all three minima. After reweighting, the predicted populations of the three states were `[80.23%, 7.71%, 12.05%]`, which perfectly matches the ground truth analytical populations of `[80.37%, 7.74%, 11.89%]`.
+
+## Beyond RealNVP: Flow Matching and the Synthetic Dipeptide
+
+While RealNVP is elegant, modern generative modeling has largely moved towards continuous-time models. In 2024, Klein & Noé published _"Transferable Boltzmann Generators"_, moving away from discrete coupling layers and towards **Continuous Normalizing Flows (CNFs)** trained via **Flow Matching**.
+
+Instead of a discrete sequence of layers, a CNF defines the transformation as an Ordinary Differential Equation (ODE):
+
+$$ \frac{d\mathbf{x}}{dt} = v\_{\theta}(\mathbf{x}(t), t) $$
+
+where $v_{\theta}$ is a neural network predicting a vector field. You sample from the prior at $t=0$ and integrate the ODE to $t=1$ to get the generated sample. Flow Matching provides a stable, simulation-free way to train these vector fields.
+
+I implemented a basic CNF using manual Euler integration and tested it on a synthetic Ramachandran dipeptide potential (a 2D potential mimicking the $\phi$ and $\psi$ dihedral angles of a protein backbone). The Flow Matching approach successfully learned the complex, periodic topology of the Ramachandran plot, accurately reproducing the populations of the four main basins.
+
+## Conclusion & Next Steps
+
+Building Boltzmann Generators from scratch was an incredible exercise in bridging deep learning and statistical mechanics. The ability to sample equilibrium states without simulating the dynamics is a paradigm shift for computational chemistry.
+
+However, scaling these models to real, 3D molecular systems introduces new challenges—specifically, dealing with rotational and translational symmetries. The next step in this journey is exploring **E(3)-equivariant flows**, which bake the physics of 3D space directly into the neural network architecture, and applying them to real molecular dynamics trajectories.
+
+If you're interested in the code, you can find the complete PyTorch implementation, including the RealNVP layers, the CNF, and the Jupyter notebooks with the experiments, in my [boltzman-generators repository](https://github.com/manumartinm/boltzman-generators).
