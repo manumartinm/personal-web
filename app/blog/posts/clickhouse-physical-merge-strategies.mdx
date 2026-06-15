@@ -1,0 +1,142 @@
+---
+title: "ClickHouse Physical Merge Strategies: Horizontal, Vertical, and a Hybrid in C++"
+publishedAt: "2026-06-15"
+summary: "A practical deep dive into physical merge algorithms in MergeTree: why ClickHouse uses horizontal and vertical merges, what trade-offs they optimize, and what we learn from building a hybrid adaptive chunked merge in C++."
+---
+
+I wanted a focused way to understand merge behavior in MergeTree without re-implementing the full storage engine again. So I built a small standalone C++ project that isolates one question: how should parts be merged when memory, throughput, and table width pull in different directions.
+
+This post summarizes what I learned from implementing and benchmarking three strategies: horizontal merge, vertical merge, and a hybrid adaptive chunked merge.
+
+## Why MergeTree needs more than one merge path
+
+In ClickHouse, `INSERT` operations create immutable parts, and background threads continuously compact those parts into larger ones to keep reads efficient ([ClickHouse, n.d.-a](https://clickhouse.com/docs/merges)). That compaction loop has to work across very different workloads: narrow tables, wide tables, low-memory nodes, and high-throughput ingest.
+
+A single merge algorithm is usually not enough. The same approach that is fast for a 6-column table can become memory-heavy for a 200-column table.
+
+## Horizontal merge
+
+Horizontal merge is the most direct model: merge sorted streams and materialize all relevant columns during that process. In my C++ implementation, this is `HorizontalMerger`.
+
+The upside is simple control flow and good throughput on modest-width schemas. The downside is peak memory, because many columns are effectively "in play" at the same time.
+
+This matches the intuition from ClickHouse merge docs and practical guidance: horizontal behavior is straightforward and fast, but can become expensive in RAM for wide data ([ClickHouse, n.d.-a](https://clickhouse.com/docs/merges); [Altinity, n.d.](https://kb.altinity.com/engines/mergetree-table-engine-family/merge-performance-final-optimize-by/)).
+
+## Vertical merge
+
+Vertical merge splits the process into two phases. First, it merges sort-key streams and records the row permutation. Then it reconstructs non-key columns using that permutation, typically column by column. In my project, this is `VerticalMerger`.
+
+The key benefit is lower memory pressure. You no longer need to keep all non-key columns active during the ordering phase.
+
+ClickHouse exposes settings around this path, such as `enable_vertical_merge_algorithm` and activation thresholds by rows and columns ([ClickHouse, n.d.-b](https://clickhouse.com/docs/operations/settings/merge-tree-settings)).
+
+## Adaptive chunked merge (hybrid, novel)
+
+I added a third algorithm called `AdaptiveChunkedMerger`. It keeps the vertical first phase (merge keys + permutation), but in the second phase it gathers non-key columns in chunks instead of one-by-one.
+
+Conceptually:
+
+- chunk size = 1 behaves closer to vertical
+- chunk size = all columns behaves closer to horizontal
+- middle chunk sizes create a controllable trade-off
+
+This specific strategy is not a public ClickHouse algorithm by that name, but it maps well to the same underlying objective: balancing memory and merge throughput under constraints.
+
+## Mapping the project to ClickHouse internals
+
+The mapping is straightforward:
+
+- `HorizontalMerger` models the horizontal merge path
+- `VerticalMerger` models the vertical merge path
+- `MergeSelector` is a simplified selector inspired by ClickHouse merge heuristics such as `SimpleMergeSelector` ([ClickHouse, n.d.-c](https://github.com/ClickHouse/ClickHouse/blob/master/src/Storages/MergeTree/SimpleMergeSelector.cpp))
+- `CompactionSimulator` models the background merge loop for parts
+
+The code is intentionally educational, so it skips many production concerns (disk formats, marks, checksums, codecs, replication coordination), but the decision logic and trade-offs are preserved.
+
+## Worked example (tiny dataset)
+
+Assume two parts sorted by key:
+
+- Part A keys: `k1, k3, k5`
+- Part B keys: `k2, k4, k6`
+- 12 non-key columns per row
+
+All three algorithms produce the same final key order:
+
+`k1, k2, k3, k4, k5, k6`
+
+The difference is how they materialize non-key columns:
+
+- horizontal: all columns during merge
+- vertical: permutation first, then one column at a time
+- adaptive chunked: permutation first, then column blocks
+
+## ASCII flow diagram
+
+```text
+INSERTS -> immutable parts
+          p1, p2, p3, ...
+
+selector picks candidates
+          |
+          v
+  [horizontal] or [vertical] or [adaptive_chunked]
+          |
+          v
+      merged part
+          |
+          v
+   fewer/larger parts on disk
+```
+
+## Short math section
+
+For a k-way merge over \(n\) total rows, heap-based merge work is typically \(O(n \log k)\). Here, \(n\) is total rows across input parts and \(k\) is number of input parts.
+
+For compaction intuition, write amplification can be approximated as:
+
+\[
+WA \approx \log_{r}\left(\frac{N}{M}\right)
+\]
+
+Where \(WA\) is average rewrite count per row, \(r\) is effective size growth ratio across levels, \(N\) is final dataset size, and \(M\) is base part size.
+
+This is not an exact ClickHouse formula, but it is useful for reasoning about compaction pressure.
+
+## Trade-offs: read, write, and space amplification
+
+Read amplification means touching too many parts during reads. Write amplification means rewriting rows multiple times due to compaction. Space amplification means temporary extra on-disk footprint while old and new parts coexist.
+
+| Strategy | Read amplification | Write amplification | Space amplification | Memory profile |
+| --- | --- | --- | --- | --- |
+| Horizontal | Lower after successful merges | Moderate to high under heavy compaction | Moderate during merges | Higher peak |
+| Vertical | Similar read outcomes if merge schedule is same | Similar rewrite totals, more phased execution | Similar temporary overlap | Lower peak |
+| Adaptive chunked | Similar read outcomes, tunable execution behavior | Similar rewrite totals, tunable chunk cost | Similar temporary overlap | Between horizontal and vertical |
+
+## Benchmark interpretation from the project
+
+On one representative run from the C++ demos:
+
+- Horizontal: `peak_memory_bytes=1671`, `columns_loaded_simultaneously=28`
+- Vertical: `peak_memory_bytes=167`, `columns_loaded_simultaneously=2`
+- Adaptive chunked: `peak_memory_bytes=519`, `columns_loaded_simultaneously=5`
+
+The result is exactly what the model predicts. The hybrid algorithm lands in the middle: it cuts memory vs horizontal while keeping broader column throughput than strict vertical.
+
+## Final take
+
+The most useful insight is not that one merge algorithm is universally "best". The useful insight is that merge strategy is a resource policy.
+
+If memory is abundant, horizontal paths can be efficient. If memory is tight or schemas are wide, vertical-style paths improve stability. A chunked hybrid can be a practical experimental bridge when you want a smoother memory/throughput dial.
+
+## References
+
+Altinity. (n.d.). *Merge performance and OPTIMIZE FINAL*. Altinity Knowledge Base. [https://kb.altinity.com/engines/mergetree-table-engine-family/merge-performance-final-optimize-by/](https://kb.altinity.com/engines/mergetree-table-engine-family/merge-performance-final-optimize-by/)
+
+ClickHouse. (n.d.-a). *Merges*. ClickHouse Docs. [https://clickhouse.com/docs/merges](https://clickhouse.com/docs/merges)
+
+ClickHouse. (n.d.-b). *MergeTree settings*. ClickHouse Docs. [https://clickhouse.com/docs/operations/settings/merge-tree-settings](https://clickhouse.com/docs/operations/settings/merge-tree-settings)
+
+ClickHouse. (n.d.-c). *SimpleMergeSelector.cpp*. GitHub. [https://github.com/ClickHouse/ClickHouse/blob/master/src/Storages/MergeTree/SimpleMergeSelector.cpp](https://github.com/ClickHouse/ClickHouse/blob/master/src/Storages/MergeTree/SimpleMergeSelector.cpp)
+
+ClickHouse. (n.d.-d). *MergeTree engine family*. ClickHouse Docs. [https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree)
